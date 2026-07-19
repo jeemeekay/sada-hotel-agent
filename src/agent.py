@@ -42,6 +42,7 @@ from hotel_client import (
     book_hotel,
 )
 from voice_utils import (
+    letters_to_word,
     normalise_email,
     normalise_phone,
     spell_phonetically,
@@ -76,12 +77,15 @@ These are the hardest things to get right over a phone line, and getting one
 wrong ruins the booking. So:
 - Wait for the caller to finish. A number like "plus four four" is the start
   of a sentence, not a phone number. Never act on a fragment.
-- When you read an email or a reference back, spell it phonetically:
-  "K for kilo, A for alpha". Never say the letters bare — they do not survive
-  a phone line. The tools give you the exact script to read; use it verbatim.
+- Always ask the caller to spell their first name and surname, and keep the
+  letters they give you. Speech recognition mishears names constantly: it
+  will report "Kyle" for someone who said Kayode. The letters they spell are
+  the truth; what you think you heard is not.
+- Never invent phonetic words. Call spell_back to get the correct script and
+  read it back word for word. It is "O for oscar", never "O for osmium".
+- Always ask for the country code with a phone number.
 - If the caller says a detail is wrong, ask only for the part that is wrong,
   not the whole thing again.
-- If a name arrives as separate letters, join them into a word and confirm.
 
 # Today's date
 Today is {today}. Use it to resolve relative dates like "next Friday".
@@ -293,6 +297,27 @@ class HotelBookingAgent(Agent):
         )
         return "\n".join(lines)
 
+    # ── Tool: phonetic script ────────────────────────────────────────
+
+    @function_tool()
+    async def spell_back(
+        self,
+        context: RunContext,
+        text: str,
+    ) -> str:
+        """Get the exact phonetic script for reading something back to the
+        caller. Use this whenever you need to confirm a name, an email, or any
+        spelling. Never invent your own phonetic words — call this and read
+        what it returns, word for word.
+
+        Args:
+            text: The word or address to spell out, e.g. "Kayode".
+        """
+        return (
+            f"Read this back exactly as written, word for word:\n"
+            f"{spell_phonetically(text)}"
+        )
+
     # ── Tool 3: Stage the booking and read it back ───────────────────
 
     @function_tool()
@@ -300,23 +325,33 @@ class HotelBookingAgent(Agent):
         self,
         context: RunContext,
         offer_id: str,
-        first_name: str,
-        last_name: str,
+        first_name_spelling: str,
+        last_name_spelling: str,
         email: str,
         phone: str,
     ) -> str:
         """Validate the caller's details and stage the booking for
-        confirmation. This does NOT book anything. Call it once you believe
-        you have all four contact details. It returns a script to read back
-        to the caller.
+        confirmation. This does NOT book anything. Call it once you have all
+        the details. It returns a script to read back to the caller.
+
+        Names must be given as the letters the caller actually spelled out,
+        not as what you thought you heard. Speech recognition mishears names
+        constantly; the spelling is the only reliable source.
 
         Args:
             offer_id: The offer_id value from get_hotel_offers.
-            first_name: The guest's first name, as a whole word.
-            last_name: The guest's surname, as a whole word.
+            first_name_spelling: The caller's first name as separated letters,
+                exactly as they spelled it, e.g. "k a y o d e".
+            last_name_spelling: The caller's surname as separated letters,
+                e.g. "o l a j i d e".
             email: The guest's email address.
-            phone: The guest's full phone number including country code.
+            phone: The guest's phone number including the country code.
         """
+        # The confirmed letters are authoritative. The STT's guess at the
+        # spoken name is not — it produced "Kyle" for a caller who had just
+        # spelled out K-A-Y-O-D-E.
+        first_name = letters_to_word(first_name_spelling)
+        last_name = letters_to_word(last_name_spelling)
         if offer_id not in self._offers:
             raise ToolError(
                 "That offer is not one of the options presented. Call "
@@ -353,18 +388,19 @@ class HotelBookingAgent(Agent):
         }
 
         return (
-            "Details staged. Nothing is booked yet. Read ALL of the following "
-            "back to the caller, then ask if everything is correct:\n"
-            f"- Hotel: {offer['hotel_name']}\n"
-            f"- Checking in {offer['check_in']}, checking out {offer['check_out']}\n"
-            f"- Total: {offer['currency']} {offer['price_total']}\n"
-            f"- Name: {first_name} {last_name}\n"
-            f"- Email, spell this out exactly as written here: "
-            f"{spell_phonetically(email_clean)}\n"
-            f"- Phone: {' '.join(phone_clean)}\n"
-            "If the caller corrects anything, call prepare_booking again with "
-            "the corrected details. Only once they confirm everything is "
-            "right, call book_hotel_room."
+            "Details staged. Nothing is booked yet.\n"
+            "Read this back in TWO short turns, not one long one — a long "
+            "block takes too long to speak and the caller loses track.\n"
+            f"Turn 1, the stay: {offer['hotel_name']}, "
+            f"{offer['check_in']} to {offer['check_out']}, "
+            f"{offer['currency']} {offer['price_total']} total. "
+            "Ask if that is right.\n"
+            f"Turn 2, the contact details: the name {first_name} {last_name}, "
+            f"the phone number {' '.join(phone_clean)}, and the email read "
+            f"exactly as written here: {spell_phonetically(email_clean)}. "
+            "Ask if that is right.\n"
+            "If anything is wrong, call prepare_booking again with the "
+            "correction. Once both are confirmed, call book_hotel_room."
         )
 
     # ── Tool 4: Commit the booking ───────────────────────────────────

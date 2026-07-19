@@ -85,13 +85,20 @@ def normalise_phone(raw: str) -> str:
 
 
 def validate_phone(phone: str) -> tuple[bool, str]:
-    """Reject partial numbers.
+    """Reject partial numbers and numbers without a country code.
 
     A caller saying "plus four four" mid-sentence must never be accepted as a
     complete number — that is exactly how a booking gets made against a
-    fragment of a turn.
+    fragment of a turn. A number with no country code is equally useless to a
+    hotel that may be in another country.
     """
     digits = "".join(c for c in phone if c.isdigit())
+    if not phone.startswith("+"):
+        return False, (
+            f"'{phone}' has no country code. Ask the caller which country "
+            "their number is in, or for the dialling code, and include it. "
+            "For the UK that is plus four four, for the UAE plus nine seven one."
+        )
     if len(digits) < 8:
         return False, (
             f"'{phone}' is only {len(digits)} digits, which is an incomplete "
@@ -116,3 +123,36 @@ def validate_name(name: str, field: str) -> tuple[bool, str]:
             "them into a single word and confirm the spelling with the caller."
         )
     return True, ""
+
+
+def letters_to_word(spelling: str) -> str:
+    """Turn a confirmed letter sequence into a word.
+
+    "k a y o d e" -> "Kayode". Also copes with "K for kilo, A for alpha"
+    by taking the first character of each comma-separated group.
+    """
+    text = spelling.strip()
+    if not text:
+        return ""
+
+    # Phonetic form: "K for kilo, A for alpha, ..."
+    if " for " in text.lower():
+        letters = [
+            part.strip()[0]
+            for part in text.split(",")
+            if part.strip()
+        ]
+        return "".join(letters).capitalize()
+
+    # Plain spaced form: "k a y o d e"
+    tokens = [t.strip(".,") for t in text.split() if t.strip(".,")]
+    if all(len(t) == 1 for t in tokens):
+        return "".join(tokens).capitalize()
+
+    # Already a word
+    return text.strip(".,").capitalize()
+
+
+def spellings_agree(name: str, spelling: str) -> bool:
+    """Check a spoken name against the letters the caller actually confirmed."""
+    return name.strip().lower() == letters_to_word(spelling).lower()
