@@ -168,15 +168,50 @@ def book_hotel(
 #  MOCK IMPLEMENTATION — realistic demo data, no API keys needed
 # ═══════════════════════════════════════════════════════════════════════
 
+def _generate_fallback_hotels(city_code: str) -> list[dict]:
+    """Deterministically generate hotels for a city with no curated data.
+
+    Must be deterministic: _mock_search_offers regenerates this same list to
+    resolve a hotel_id back to its name, so IDs stay valid across calls.
+    """
+    chains = [
+        "Grand Plaza",
+        "Marriott",
+        "Hilton",
+        "Novotel",
+        "Ibis",
+    ]
+    return [
+        {
+            "hotel_id": f"HT{city_code}{i:03d}",
+            "name": f"{chain} {city_code}",
+            "iata_code": city_code,
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "distance_km": round(0.5 + i * 1.2, 1),
+        }
+        for i, chain in enumerate(chains, 1)
+    ]
+
+
+def _lookup_hotel(hotel_id: str) -> dict | None:
+    """Resolve a hotel_id to its record, including generated fallback cities."""
+    for city_hotels in MOCK_HOTELS.values():
+        for h in city_hotels:
+            if h["hotel_id"] == hotel_id:
+                return h
+
+    # Fallback IDs look like HT<CITY><NNN>, e.g. HTTYO002
+    if hotel_id.startswith("HT") and len(hotel_id) >= 8:
+        city_code = hotel_id[2:-3]
+        for h in _generate_fallback_hotels(city_code):
+            if h["hotel_id"] == hotel_id:
+                return h
+    return None
+
+
 def _mock_search_hotels(city_code: str, max_results: int) -> list[dict]:
-    hotels = MOCK_HOTELS.get(city_code, [])
-    if not hotels:
-        # Generate generic hotels for any unsupported city
-        hotels = [
-            {"hotel_id": f"HT{city_code}{i:03d}", "name": f"Hotel {city_code} {i}",
-             "iata_code": city_code, "latitude": 0, "longitude": 0, "distance_km": i * 1.5}
-            for i in range(1, 5)
-        ]
+    hotels = MOCK_HOTELS.get(city_code) or _generate_fallback_hotels(city_code)
     return hotels[:max_results]
 
 
@@ -187,23 +222,21 @@ def _mock_search_offers(
     adults: int,
     rooms: int,
 ) -> list[dict]:
-    # Calculate number of nights
+    # Parse dates. Raise a clear error rather than silently continuing —
+    # the caller (agent tool) turns this into a spoken message.
     try:
         ci = datetime.strptime(check_in, "%Y-%m-%d")
         co = datetime.strptime(check_out, "%Y-%m-%d")
-        nights = max((co - ci).days, 1)
     except ValueError:
-        nights = 1
-
-    # Find the hotel name from our mock data
-    all_hotels = {}
-    for city_hotels in MOCK_HOTELS.values():
-        for h in city_hotels:
-            all_hotels[h["hotel_id"]] = h
+        raise ValueError(
+            f"Dates must be YYYY-MM-DD. Got check_in={check_in!r}, "
+            f"check_out={check_out!r}."
+        )
+    nights = max((co - ci).days, 1)
 
     offers = []
     for hotel_id in hotel_ids:
-        hotel = all_hotels.get(hotel_id)
+        hotel = _lookup_hotel(hotel_id)
         if not hotel:
             continue
 
