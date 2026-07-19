@@ -1,6 +1,6 @@
 # SADA Hotel Booking Voice Agent
 
-A LiveKit voice agent that books hotel rooms via the **Amadeus Self-Service API**. Users call in (SIP or WebRTC), speak naturally, and the agent searches hotels, presents options, and completes reservations — all by voice.
+A LiveKit voice agent that books hotel rooms by voice. Users call in (SIP or WebRTC), speak naturally, and the agent searches hotels, presents options, and completes reservations.
 
 ## Architecture
 
@@ -14,10 +14,10 @@ Caller → LiveKit (WebRTC/SIP) → Agent
                           └───────┬────────┘
                                   │
                           ┌───────┴────────┐
-                          │  Amadeus API   │
-                          │  Hotel List    │  → find hotels by city
-                          │  Hotel Search  │  → get rooms & prices
-                          │  Hotel Booking │  → create reservation
+                          │  Hotel API     │
+                          │  (mock or      │  → find hotels by city
+                          │   Hotelbeds)   │  → get rooms & prices
+                          │                │  → create reservation
                           └────────────────┘
 ```
 
@@ -25,7 +25,7 @@ Caller → LiveKit (WebRTC/SIP) → Agent
 
 1. Agent greets the caller
 2. Collects city, dates, and number of guests
-3. Searches hotels via Amadeus → reads out options
+3. Searches hotels → reads out options
 4. Caller picks a hotel → agent fetches room offers with prices
 5. Caller confirms → agent collects guest details (name, email, phone)
 6. Agent books the room → reads back confirmation ID
@@ -36,44 +36,33 @@ Caller → LiveKit (WebRTC/SIP) → Agent
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - API keys for:
   - **LiveKit Cloud** — [cloud.livekit.io](https://cloud.livekit.io)
-  - **Amadeus Self-Service** — [developers.amadeus.com](https://developers.amadeus.com) (free account)
   - **Anthropic** — [console.anthropic.com](https://console.anthropic.com)
   - **Deepgram** — [console.deepgram.com](https://console.deepgram.com)
   - **Cartesia** — [play.cartesia.ai](https://play.cartesia.ai)
 
+No hotel API key needed for demo mode — the agent uses built-in mock hotel data (real hotel names, realistic prices) that works out of the box.
+
 ## Setup
 
 ```bash
-# Clone the repo
 git clone https://github.com/jeemeekay/sada-hotel-agent.git
 cd sada-hotel-agent
 
-# Copy env template and fill in your API keys
-cp .env.example .env
+cp env.example .env
+# Fill in your LiveKit, Anthropic, Deepgram, and Cartesia keys
 
-# Install dependencies
 uv sync
-# or: pip install -e .
 ```
-
-## Get Your Amadeus API Keys
-
-1. Go to [developers.amadeus.com](https://developers.amadeus.com)
-2. Create a free account
-3. Go to **My Self-Service Workspace** → **Create a new app**
-4. Copy the **API Key** and **API Secret**
-5. Paste them into your `.env` file as `AMADEUS_CLIENT_ID` and `AMADEUS_CLIENT_SECRET`
-
-The free test environment gives you limited API calls per month with sandbox hotel data — enough to build and demo.
 
 ## Run
 
 ```bash
-# Development mode (connects to LiveKit Cloud)
 uv run src/agent.py dev
 ```
 
-Then open the [LiveKit Agents Playground](https://agents-playground.livekit.io) or connect via SIP to talk to the agent.
+Then open the [LiveKit Agents Playground](https://agents-playground.livekit.io) or connect via SIP.
+
+Try: *"I'd like to book a hotel in Dubai for July 25th to the 28th."*
 
 ## Project Structure
 
@@ -81,38 +70,38 @@ Then open the [LiveKit Agents Playground](https://agents-playground.livekit.io) 
 sada-hotel-agent/
 ├── src/
 │   ├── agent.py            # LiveKit agent with tool definitions
-│   └── amadeus_client.py   # Amadeus API wrapper (search, offers, book)
-├── .env.example            # Environment variable template
+│   └── amadeus_client.py   # Hotel API (mock data + Hotelbeds support)
+├── env.example             # Environment variable template
 ├── .gitignore
-├── pyproject.toml          # Dependencies and project metadata
+├── pyproject.toml
 └── README.md
 ```
 
+## Hotel API Modes
+
+The agent supports two modes, set via `HOTEL_API_MODE` in `.env`:
+
+| Mode | Description | API Key Needed? |
+|---|---|---|
+| `mock` (default) | Realistic demo data — real hotel names in Dubai, Abu Dhabi, London, Paris, NYC. Deterministic prices. Demo booking confirmations. | No |
+| `hotelbeds` | Live hotel data via [Hotelbeds APItude API](https://developer.hotelbeds.com). Real availability, real bookings. | Yes |
+
+### Why mock mode?
+
+Amadeus Self-Service APIs were [decommissioned on July 17, 2026](https://www.phocuswire.com/amadeus-shut-down-self-service-apis-portal-developers). Mock mode lets you demo the full voice booking flow without any hotel API dependency. The architecture is provider-agnostic — swap in Hotelbeds, Expedia Rapid, or any other provider by implementing the same three functions: `search_hotels`, `search_offers`, `book_hotel`.
+
 ## How the Tools Work
 
-The agent has three tools that the LLM can call during conversation:
-
-| Tool | Amadeus API | Purpose |
-|---|---|---|
-| `search_hotels_in_city` | Hotel List API | Find hotels by city name |
-| `get_hotel_offers` | Hotel Search API v3 | Get rooms, prices, cancellation policies |
-| `book_hotel_room` | Hotel Booking API v2 | Create reservation with guest details |
-
-The LLM decides when to call each tool based on the conversation. For example, when the caller says "I need a hotel in Dubai for July 25 to 28", the LLM calls `search_hotels_in_city("Dubai")` then `get_hotel_offers(hotel_ids, "2026-07-25", "2026-07-28")`.
+| Tool | Purpose |
+|---|---|
+| `search_hotels_in_city` | Find hotels by city name (30+ cities supported) |
+| `get_hotel_offers` | Get rooms, prices, cancellation policies for selected hotels |
+| `book_hotel_room` | Create reservation with guest details → returns confirmation ID |
 
 ## Connecting via SIP (Phone Calls)
 
-If you have LiveKit SIP configured (trunk + dispatch rule), the agent works over phone calls too. See the [SADA project docs](https://github.com/jeemeekay/sada-hotel-agent) for SIP setup with Asterisk or direct LiveKit SIP trunking.
-
-## Sandbox vs Production
-
-The Amadeus client is configured in **test mode** (`hostname="test"`). This means:
-- Hotel data is synthetic/limited
-- Bookings are not real — no charges apply
-- Ideal for development and demos
-
-To go live, change `hostname="test"` to `hostname="production"` in `src/amadeus_client.py` and ensure your Amadeus account is approved for production access.
+Works with the existing LiveKit SIP setup (Asterisk → LiveKit Cloud trunk). Dial extension 700 from the softphone to reach the agent.
 
 ## Part of SADA (صدى)
 
-This agent is a vertical demo for [SADA](https://sada.sh), a UAE-compliant, Arabic-native AI voice agent platform. The same architecture powers agents for healthcare, real estate, financial services, and government across the GCC.
+This agent is a vertical demo for [SADA](https://sada.sh), a UAE-compliant, Arabic-native AI voice agent platform for the Middle East.

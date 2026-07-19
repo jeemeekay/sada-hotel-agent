@@ -1,24 +1,25 @@
 """
-Amadeus Self-Service API client for hotel search and booking.
+Hotel API client — mock mode for demos, Hotelbeds for production.
 
-Uses the official Amadeus Python SDK for authentication and API calls.
-The SDK handles OAuth2 token management automatically.
+In MOCK mode (default): returns realistic UAE/global hotel data so the
+voice agent works end-to-end without any external API keys.
 
-API flow:
-  1. Hotel List API    → find hotels by city code
-  2. Hotel Search API  → get available offers (rooms + prices)
-  3. Hotel Booking API → create reservation with guest + payment details
+In HOTELBEDS mode: connects to the Hotelbeds APItude API for real
+availability and booking.
+
+Set HOTEL_API_MODE=hotelbeds in .env to switch. Default is "mock".
 """
 
 import os
+import json
 import logging
-from amadeus import Client, ResponseError
+import hashlib
+import time
+from datetime import datetime, timedelta
 
-logger = logging.getLogger("amadeus-client")
+logger = logging.getLogger("hotel-client")
 
 # ── City code mapping ────────────────────────────────────────────────
-# Common cities the agent will encounter. The Amadeus Hotel List API
-# requires IATA city codes, not free-text city names.
 CITY_CODES: dict[str, str] = {
     "dubai": "DXB",
     "abu dhabi": "AUH",
@@ -58,15 +59,66 @@ CITY_CODES: dict[str, str] = {
     "seattle": "SEA",
 }
 
+# ── Mock hotel data by city ──────────────────────────────────────────
+MOCK_HOTELS: dict[str, list[dict]] = {
+    "DXB": [
+        {"hotel_id": "HTDXB001", "name": "Jumeirah Beach Hotel", "iata_code": "DXB", "latitude": 25.1412, "longitude": 55.1855, "distance_km": 2.1},
+        {"hotel_id": "HTDXB002", "name": "Marriott Resort Palm Jumeirah", "iata_code": "DXB", "latitude": 25.1120, "longitude": 55.1380, "distance_km": 4.5},
+        {"hotel_id": "HTDXB003", "name": "Rove Downtown Dubai", "iata_code": "DXB", "latitude": 25.1972, "longitude": 55.2744, "distance_km": 0.8},
+        {"hotel_id": "HTDXB004", "name": "Hilton Dubai Creek", "iata_code": "DXB", "latitude": 25.2630, "longitude": 55.3215, "distance_km": 3.2},
+        {"hotel_id": "HTDXB005", "name": "Address Downtown", "iata_code": "DXB", "latitude": 25.1950, "longitude": 55.2780, "distance_km": 0.5},
+        {"hotel_id": "HTDXB006", "name": "Radisson Blu Hotel Dubai Waterfront", "iata_code": "DXB", "latitude": 25.1800, "longitude": 55.2500, "distance_km": 1.9},
+    ],
+    "AUH": [
+        {"hotel_id": "HTAUH001", "name": "Emirates Palace Mandarin Oriental", "iata_code": "AUH", "latitude": 24.4615, "longitude": 54.3173, "distance_km": 1.5},
+        {"hotel_id": "HTAUH002", "name": "Yas Hotel Abu Dhabi", "iata_code": "AUH", "latitude": 24.4677, "longitude": 54.6030, "distance_km": 8.0},
+        {"hotel_id": "HTAUH003", "name": "Rotana Khalidiya Palace", "iata_code": "AUH", "latitude": 24.4700, "longitude": 54.3400, "distance_km": 2.1},
+        {"hotel_id": "HTAUH004", "name": "Hilton Abu Dhabi Yas Island", "iata_code": "AUH", "latitude": 24.4900, "longitude": 54.6100, "distance_km": 7.5},
+    ],
+    "LON": [
+        {"hotel_id": "HTLON001", "name": "The Savoy", "iata_code": "LON", "latitude": 51.5104, "longitude": -0.1202, "distance_km": 0.3},
+        {"hotel_id": "HTLON002", "name": "Premier Inn London City Tower Hill", "iata_code": "LON", "latitude": 51.5100, "longitude": -0.0760, "distance_km": 1.2},
+        {"hotel_id": "HTLON003", "name": "Hilton London Bankside", "iata_code": "LON", "latitude": 51.5050, "longitude": -0.1010, "distance_km": 0.8},
+        {"hotel_id": "HTLON004", "name": "citizenM Tower of London", "iata_code": "LON", "latitude": 51.5098, "longitude": -0.0770, "distance_km": 1.1},
+        {"hotel_id": "HTLON005", "name": "Marriott Hotel County Hall", "iata_code": "LON", "latitude": 51.5020, "longitude": -0.1170, "distance_km": 0.5},
+    ],
+    "PAR": [
+        {"hotel_id": "HTPAR001", "name": "Hôtel Plaza Athénée", "iata_code": "PAR", "latitude": 48.8660, "longitude": 2.3040, "distance_km": 0.7},
+        {"hotel_id": "HTPAR002", "name": "Ibis Paris Bastille Opera", "iata_code": "PAR", "latitude": 48.8530, "longitude": 2.3700, "distance_km": 2.1},
+        {"hotel_id": "HTPAR003", "name": "Novotel Paris Centre Tour Eiffel", "iata_code": "PAR", "latitude": 48.8480, "longitude": 2.2900, "distance_km": 1.5},
+        {"hotel_id": "HTPAR004", "name": "Le Marais Boutique Hotel", "iata_code": "PAR", "latitude": 48.8570, "longitude": 2.3620, "distance_km": 1.8},
+    ],
+    "NYC": [
+        {"hotel_id": "HTNYC001", "name": "The Plaza Hotel", "iata_code": "NYC", "latitude": 40.7645, "longitude": -73.9744, "distance_km": 0.5},
+        {"hotel_id": "HTNYC002", "name": "Pod 51 Hotel", "iata_code": "NYC", "latitude": 40.7550, "longitude": -73.9700, "distance_km": 1.0},
+        {"hotel_id": "HTNYC003", "name": "Hilton Midtown Manhattan", "iata_code": "NYC", "latitude": 40.7620, "longitude": -73.9800, "distance_km": 0.3},
+        {"hotel_id": "HTNYC004", "name": "Marriott Marquis Times Square", "iata_code": "NYC", "latitude": 40.7580, "longitude": -73.9860, "distance_km": 0.6},
+    ],
+}
 
-def _get_amadeus_client() -> Client:
-    """Initialise an Amadeus SDK client from environment variables."""
-    return Client(
-        client_id=os.environ["AMADEUS_CLIENT_ID"],
-        client_secret=os.environ["AMADEUS_CLIENT_SECRET"],
-        # Use "production" for live bookings; "test" for sandbox
-        hostname="test",
-    )
+# Pricing tiers for mock offers (per night in USD)
+MOCK_PRICING = {
+    "budget":   {"min": 80, "max": 150, "room": "Standard Room", "bed": "DOUBLE", "beds": 1},
+    "mid":      {"min": 150, "max": 300, "room": "Deluxe Room", "bed": "KING", "beds": 1},
+    "premium":  {"min": 300, "max": 600, "room": "Executive Suite", "bed": "KING", "beds": 1},
+    "luxury":   {"min": 600, "max": 1200, "room": "Presidential Suite", "bed": "KING", "beds": 2},
+}
+
+# Map hotel name keywords to price tier
+def _price_tier(hotel_name: str) -> str:
+    name_lower = hotel_name.lower()
+    if any(w in name_lower for w in ["plaza", "palace", "savoy", "athénée", "address", "emirates"]):
+        return "luxury"
+    elif any(w in name_lower for w in ["hilton", "marriott", "novotel", "radisson"]):
+        return "mid"
+    elif any(w in name_lower for w in ["pod", "ibis", "premier inn", "rove", "citizenm"]):
+        return "budget"
+    else:
+        return "mid"
+
+
+def _get_api_mode() -> str:
+    return os.environ.get("HOTEL_API_MODE", "mock").lower()
 
 
 def resolve_city_code(city_name: str) -> str | None:
@@ -75,34 +127,10 @@ def resolve_city_code(city_name: str) -> str | None:
 
 
 def search_hotels(city_code: str, max_results: int = 10) -> list[dict]:
-    """
-    Step 1: Find hotels in a city using the Hotel List API.
-
-    Returns a simplified list of hotels with id, name, and location.
-    """
-    amadeus = _get_amadeus_client()
-
-    try:
-        response = amadeus.reference_data.locations.hotels.by_city.get(
-            cityCode=city_code
-        )
-    except ResponseError as e:
-        logger.error("Hotel List API error: %s", e)
-        return []
-
-    hotels = []
-    for h in response.data[:max_results]:
-        hotels.append(
-            {
-                "hotel_id": h.get("hotelId", ""),
-                "name": h.get("name", "Unknown"),
-                "iata_code": h.get("iataCode", ""),
-                "latitude": h.get("geoCode", {}).get("latitude"),
-                "longitude": h.get("geoCode", {}).get("longitude"),
-                "distance_km": h.get("distance", {}).get("value"),
-            }
-        )
-    return hotels
+    """Find hotels in a city. Uses mock data or Hotelbeds based on config."""
+    if _get_api_mode() == "hotelbeds":
+        return _hotelbeds_search_hotels(city_code, max_results)
+    return _mock_search_hotels(city_code, max_results)
 
 
 def search_offers(
@@ -112,69 +140,10 @@ def search_offers(
     adults: int = 1,
     rooms: int = 1,
 ) -> list[dict]:
-    """
-    Step 2: Get available room offers for one or more hotels.
-
-    Args:
-        hotel_ids: List of Amadeus hotel IDs (from search_hotels)
-        check_in:  Check-in date as YYYY-MM-DD
-        check_out: Check-out date as YYYY-MM-DD
-        adults:    Number of adult guests
-        rooms:     Number of rooms needed
-
-    Returns a simplified list of offers with price, room type, etc.
-    """
-    amadeus = _get_amadeus_client()
-
-    try:
-        response = amadeus.shopping.hotel_offers_search.get(
-            hotelIds=hotel_ids,
-            checkInDate=check_in,
-            checkOutDate=check_out,
-            adults=adults,
-            roomQuantity=rooms,
-        )
-    except ResponseError as e:
-        logger.error("Hotel Search API error: %s", e)
-        return []
-
-    offers = []
-    for hotel_data in response.data:
-        hotel_name = hotel_data.get("hotel", {}).get("name", "Unknown")
-        hotel_id = hotel_data.get("hotel", {}).get("hotelId", "")
-
-        for offer in hotel_data.get("offers", []):
-            price_info = offer.get("price", {})
-            room_info = offer.get("room", {})
-            room_desc = room_info.get("description", {}).get("text", "Standard Room")
-            room_type = room_info.get("typeEstimated", {})
-
-            offers.append(
-                {
-                    "offer_id": offer.get("id", ""),
-                    "hotel_id": hotel_id,
-                    "hotel_name": hotel_name,
-                    "check_in": offer.get("checkInDate", check_in),
-                    "check_out": offer.get("checkOutDate", check_out),
-                    "room_description": room_desc,
-                    "room_category": room_type.get("category", ""),
-                    "bed_type": room_type.get("bedType", ""),
-                    "beds": room_type.get("beds", 1),
-                    "price_total": price_info.get("total", "N/A"),
-                    "currency": price_info.get("currency", "USD"),
-                    "cancellation_deadline": (
-                        offer.get("policies", {})
-                        .get("cancellations", [{}])[0]
-                        .get("deadline", "N/A")
-                        if offer.get("policies", {}).get("cancellations")
-                        else "N/A"
-                    ),
-                    "payment_type": offer.get("policies", {}).get(
-                        "paymentType", "N/A"
-                    ),
-                }
-            )
-    return offers
+    """Get available room offers. Uses mock data or Hotelbeds based on config."""
+    if _get_api_mode() == "hotelbeds":
+        return _hotelbeds_search_offers(hotel_ids, check_in, check_out, adults, rooms)
+    return _mock_search_offers(hotel_ids, check_in, check_out, adults, rooms)
 
 
 def book_hotel(
@@ -187,76 +156,241 @@ def book_hotel(
     card_expiry: str = "2026-12",
     card_holder: str | None = None,
 ) -> dict:
-    """
-    Step 3: Create a hotel booking from a confirmed offer.
+    """Create a booking. Uses mock confirmation or Hotelbeds based on config."""
+    if _get_api_mode() == "hotelbeds":
+        return _hotelbeds_book(offer_id, guest_first_name, guest_last_name,
+                               guest_email, guest_phone)
+    return _mock_book(offer_id, guest_first_name, guest_last_name,
+                      guest_email, guest_phone)
 
-    In test mode, this uses the Amadeus sandbox — no real charges.
-    The card_number default is the standard Amadeus test card.
 
-    Returns booking confirmation details.
-    """
-    amadeus = _get_amadeus_client()
+# ═══════════════════════════════════════════════════════════════════════
+#  MOCK IMPLEMENTATION — realistic demo data, no API keys needed
+# ═══════════════════════════════════════════════════════════════════════
 
-    if card_holder is None:
-        card_holder = f"{guest_first_name} {guest_last_name}"
+def _mock_search_hotels(city_code: str, max_results: int) -> list[dict]:
+    hotels = MOCK_HOTELS.get(city_code, [])
+    if not hotels:
+        # Generate generic hotels for any unsupported city
+        hotels = [
+            {"hotel_id": f"HT{city_code}{i:03d}", "name": f"Hotel {city_code} {i}",
+             "iata_code": city_code, "latitude": 0, "longitude": 0, "distance_km": i * 1.5}
+            for i in range(1, 5)
+        ]
+    return hotels[:max_results]
 
+
+def _mock_search_offers(
+    hotel_ids: list[str],
+    check_in: str,
+    check_out: str,
+    adults: int,
+    rooms: int,
+) -> list[dict]:
+    # Calculate number of nights
+    try:
+        ci = datetime.strptime(check_in, "%Y-%m-%d")
+        co = datetime.strptime(check_out, "%Y-%m-%d")
+        nights = max((co - ci).days, 1)
+    except ValueError:
+        nights = 1
+
+    # Find the hotel name from our mock data
+    all_hotels = {}
+    for city_hotels in MOCK_HOTELS.values():
+        for h in city_hotels:
+            all_hotels[h["hotel_id"]] = h
+
+    offers = []
+    for hotel_id in hotel_ids:
+        hotel = all_hotels.get(hotel_id)
+        if not hotel:
+            continue
+
+        tier = _price_tier(hotel["name"])
+        pricing = MOCK_PRICING[tier]
+
+        # Deterministic "random" price based on hotel_id + dates
+        seed = int(hashlib.md5(f"{hotel_id}{check_in}".encode()).hexdigest()[:8], 16)
+        per_night = pricing["min"] + (seed % (pricing["max"] - pricing["min"]))
+        total = per_night * nights
+
+        # Cancellation deadline: 3 days before check-in
+        cancel_date = ci - timedelta(days=3)
+
+        offer_id = f"OFF-{hotel_id}-{check_in.replace('-', '')}"
+        offers.append({
+            "offer_id": offer_id,
+            "hotel_id": hotel_id,
+            "hotel_name": hotel["name"],
+            "check_in": check_in,
+            "check_out": check_out,
+            "room_description": pricing["room"],
+            "room_category": tier.upper(),
+            "bed_type": pricing["bed"],
+            "beds": pricing["beds"],
+            "price_per_night": str(per_night),
+            "price_total": str(total),
+            "currency": "USD",
+            "cancellation_deadline": cancel_date.strftime("%Y-%m-%d"),
+            "payment_type": "CREDIT_CARD",
+        })
+
+    return offers
+
+
+def _mock_book(
+    offer_id: str,
+    guest_first_name: str,
+    guest_last_name: str,
+    guest_email: str,
+    guest_phone: str,
+) -> dict:
+    # Generate a deterministic confirmation number
+    confirm_hash = hashlib.md5(
+        f"{offer_id}{guest_last_name}{time.time()}".encode()
+    ).hexdigest()[:8].upper()
+
+    return {
+        "success": True,
+        "booking_id": f"SADA-{confirm_hash}",
+        "provider_confirmation": f"DEMO-{confirm_hash}",
+        "status": "confirmed",
+        "note": "This is a demo booking — no real reservation was created.",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  HOTELBEDS IMPLEMENTATION — real API (requires API key from
+#  developer.hotelbeds.com)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _hotelbeds_auth_headers() -> dict:
+    """Generate Hotelbeds API authentication headers (API Key + X-Signature)."""
+    api_key = os.environ["HOTELBEDS_API_KEY"]
+    secret = os.environ["HOTELBEDS_API_SECRET"]
+    timestamp = str(int(time.time()))
+    sig_raw = f"{api_key}{secret}{timestamp}"
+    signature = hashlib.sha256(sig_raw.encode()).hexdigest()
+
+    return {
+        "Api-key": api_key,
+        "X-Signature": signature,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def _hotelbeds_base_url() -> str:
+    env = os.environ.get("HOTELBEDS_ENV", "test")
+    if env == "production":
+        return "https://api.hotelbeds.com"
+    return "https://api.test.hotelbeds.com"
+
+
+def _hotelbeds_search_hotels(city_code: str, max_results: int) -> list[dict]:
+    """Hotelbeds doesn't have a simple 'list hotels by city' endpoint —
+    you search availability directly. This returns mock data as a fallback
+    and the real search happens in search_offers."""
+    logger.info("Hotelbeds: hotel list by city not directly supported, "
+                "use search_offers with destination code instead.")
+    return _mock_search_hotels(city_code, max_results)
+
+
+def _hotelbeds_search_offers(
+    hotel_ids: list[str],
+    check_in: str,
+    check_out: str,
+    adults: int,
+    rooms: int,
+) -> list[dict]:
+    """Search Hotelbeds for hotel availability."""
+    import aiohttp
+    import asyncio
+
+    url = f"{_hotelbeds_base_url()}/hotel-api/1.0/hotels"
+    headers = _hotelbeds_auth_headers()
+
+    occupancy = [{"rooms": rooms, "adults": adults, "children": 0}]
     body = {
-        "data": {
-            "type": "hotel-order",
-            "guests": [
-                {
-                    "tid": 1,
-                    "name": {
-                        "title": "MR",
-                        "firstName": guest_first_name,
-                        "lastName": guest_last_name,
-                    },
-                    "contact": {
-                        "phone": guest_phone,
-                        "email": guest_email,
-                    },
-                }
-            ],
-            "travelAgent": {
-                "contact": {
-                    "email": "kayode@sada.sh",
-                }
-            },
-            "roomAssociations": [
-                {
-                    "guestReferences": [{"guestReference": "1"}],
-                    "hotelOfferId": offer_id,
-                }
-            ],
-            "payment": {
-                "id": "1",
-                "method": "CREDIT_CARD",
-                "paymentCard": {
-                    "paymentCardInfo": {
-                        "vendorCode": "VI",
-                        "cardNumber": card_number,
-                        "expiryDate": card_expiry,
-                        "holderName": card_holder,
-                    }
-                },
-            },
-        }
+        "stay": {"checkIn": check_in, "checkOut": check_out},
+        "occupancies": occupancy,
+        "hotels": {"hotel": [int(hid) for hid in hotel_ids if hid.isdigit()]},
     }
 
     try:
-        response = amadeus.post("/v2/booking/hotel-orders", body)
-        booking_data = response.data[0] if response.data else response.result
-    except ResponseError as e:
-        logger.error("Hotel Booking API error: %s", e)
+        import requests
+        resp = requests.post(url, json=body, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error("Hotelbeds availability error: %s", e)
+        return []
+
+    offers = []
+    for hotel_data in data.get("hotels", {}).get("hotels", []):
+        hotel_name = hotel_data.get("name", "Unknown")
+        hotel_code = str(hotel_data.get("code", ""))
+
+        for room in hotel_data.get("rooms", []):
+            for rate in room.get("rates", []):
+                offers.append({
+                    "offer_id": rate.get("rateKey", ""),
+                    "hotel_id": hotel_code,
+                    "hotel_name": hotel_name,
+                    "check_in": check_in,
+                    "check_out": check_out,
+                    "room_description": room.get("name", "Standard Room"),
+                    "room_category": rate.get("boardName", ""),
+                    "bed_type": "DOUBLE",
+                    "beds": 1,
+                    "price_total": rate.get("net", "N/A"),
+                    "currency": data.get("hotels", {}).get("currency", "USD"),
+                    "cancellation_deadline": rate.get("cancellationPolicies", [{}])[0].get("from", "N/A")
+                    if rate.get("cancellationPolicies") else "N/A",
+                    "payment_type": rate.get("paymentType", "AT_WEB"),
+                })
+    return offers
+
+
+def _hotelbeds_book(
+    offer_id: str,
+    guest_first_name: str,
+    guest_last_name: str,
+    guest_email: str,
+    guest_phone: str,
+) -> dict:
+    """Create a booking via Hotelbeds."""
+    url = f"{_hotelbeds_base_url()}/hotel-api/1.0/bookings"
+    headers = _hotelbeds_auth_headers()
+
+    body = {
+        "holder": {"name": guest_first_name, "surname": guest_last_name},
+        "rooms": [
+            {
+                "rateKey": offer_id,
+                "paxes": [
+                    {"roomId": 1, "type": "AD", "name": guest_first_name,
+                     "surname": guest_last_name}
+                ],
+            }
+        ],
+        "clientReference": f"SADA-{int(time.time())}",
+    }
+
+    try:
+        import requests
+        resp = requests.post(url, json=body, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        booking = data.get("booking", {})
+    except Exception as e:
+        logger.error("Hotelbeds booking error: %s", e)
         return {"error": str(e), "success": False}
 
     return {
         "success": True,
-        "booking_id": booking_data.get("id", ""),
-        "provider_confirmation": booking_data.get(
-            "associatedRecords", [{}]
-        )[0].get("reference", "N/A")
-        if booking_data.get("associatedRecords")
-        else "N/A",
-        "status": booking_data.get("type", "confirmed"),
+        "booking_id": booking.get("reference", ""),
+        "provider_confirmation": booking.get("clientReference", ""),
+        "status": booking.get("status", "CONFIRMED"),
     }

@@ -1,9 +1,9 @@
 """
 SADA Hotel Booking Voice Agent
 
-A LiveKit voice agent that helps users search for and book hotels
-using the Amadeus Self-Service API. Uses Claude as the LLM,
-Deepgram for STT, and Cartesia for TTS.
+A LiveKit voice agent that helps users search for and book hotels.
+Uses Claude as the LLM, Deepgram for STT, and Cartesia for TTS.
+Hotel data comes from mock mode (default) or Hotelbeds API.
 
 Run:
     uv run src/agent.py dev
