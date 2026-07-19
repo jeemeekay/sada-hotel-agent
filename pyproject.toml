@@ -5,8 +5,7 @@ description = "SADA Hotel Booking Voice Agent — LiveKit + Amadeus Self-Service
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "livekit-agents[deepgram,cartesia]~=1.6",
-    "livekit-plugins-anthropic~=1.1",
+    "livekit-agents~=1.6",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
 ]

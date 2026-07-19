@@ -18,9 +18,9 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
+    inference,
 )
 from livekit.agents.llm import ToolError
-from livekit.plugins import anthropic, cartesia, deepgram
 
 from amadeus_client import (
     resolve_city_code,
@@ -231,15 +231,10 @@ async def entrypoint(ctx):
     await session.start(
         agent=HotelBookingAgent(),
         room=ctx.room,
-        # ── STT: Deepgram Nova-3 (multilingual) ─────────────
-        stt=deepgram.STT(model="nova-3", language="en"),
-        # ── LLM: Anthropic Claude ───────────────────────────
-        llm=anthropic.LLM(model="claude-sonnet-4-20250514"),
-        # ── TTS: Cartesia Sonic ─────────────────────────────
-        tts=cartesia.TTS(
-            model="sonic",
-            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
-        ),
+        # All models via LiveKit Inference — only LIVEKIT_* keys needed
+        stt=inference.STT(model="deepgram/nova-3"),
+        llm=inference.LLM(model="google/gemini-2.5-flash"),
+        tts=inference.TTS(model="cartesia/sonic", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
     )
 
 
