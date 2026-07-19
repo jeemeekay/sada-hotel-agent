@@ -205,3 +205,79 @@ def letters_to_word(spelling: str) -> str:
 def spellings_agree(name: str, spelling: str) -> bool:
     """Check a spoken name against the letters the caller actually confirmed."""
     return name.strip().lower() == letters_to_word(spelling).lower()
+
+
+# ── Spoken-form parsing ──────────────────────────────────────────────
+# Callers dictate addresses as words: "k a y o d e at o four j dot co dot
+# u k". Those words must become characters BEFORE anything is spelled back,
+# otherwise "four" gets read out as F-O-U-R and the caller hears nonsense.
+
+NUMBER_WORDS = {
+    "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3",
+    "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
+    "nine": "9",
+}
+
+SYMBOL_WORDS = {
+    "dot": ".", "point": ".", "period": ".", "full-stop": ".",
+    "at": "@",
+    "dash": "-", "hyphen": "-", "minus": "-",
+    "underscore": "_", "under-score": "_",
+    "plus": "+",
+}
+
+# Words a caller says around the address that are not part of it
+FILLER_WORDS = {
+    "my", "email", "address", "is", "it's", "its", "the", "and",
+    "symbol", "sign", "please", "so", "that's", "thats",
+}
+
+
+def parse_spoken_text(spoken: str) -> str:
+    """Turn a dictated string into the characters it represents.
+
+    "k a y o d e at o four j dot co dot u k" -> "kayode@o4j.co.uk"
+
+    Single letters are joined, number words become digits, and symbol words
+    become symbols. Multi-letter tokens like "co" or "kayode" pass through
+    as-is, so a caller can mix spelling and speaking freely.
+    """
+    out: list[str] = []
+    for raw in spoken.lower().split():
+        token = raw.strip(".,!?;:")
+        if not token:
+            continue
+        if token in FILLER_WORDS:
+            continue
+        if token in NUMBER_WORDS:
+            out.append(NUMBER_WORDS[token])
+        elif token in SYMBOL_WORDS:
+            out.append(SYMBOL_WORDS[token])
+        else:
+            out.append(token)
+    return "".join(out)
+
+
+def parse_spoken_email(spoken: str) -> tuple[str, str]:
+    """Parse a dictated email. Returns (address, problem).
+
+    problem is an empty string when the address is usable, otherwise a
+    message phrased so the agent can ask one specific follow-up question.
+    """
+    address = parse_spoken_text(spoken)
+
+    if not address:
+        return "", "Nothing was captured. Ask the caller to say it again."
+
+    if "@" not in address:
+        return address, (
+            f"The caller did not say where the at symbol goes — what came "
+            f"through was '{address}'. Ask them only this: which part comes "
+            "before the at symbol? Do not ask for the whole address again."
+        )
+
+    ok, why = validate_email(address)
+    if not ok:
+        return address, why
+
+    return address, ""

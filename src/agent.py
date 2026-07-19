@@ -43,8 +43,9 @@ from hotel_client import (
 )
 from voice_utils import (
     letters_to_word,
-    normalise_email,
     normalise_phone,
+    parse_spoken_email,
+    parse_spoken_text,
     spell_phonetically,
     validate_email,
     validate_name,
@@ -83,6 +84,16 @@ wrong ruins the booking. So:
   the truth; what you think you heard is not.
 - Never invent phonetic words. Call spell_back to get the correct script and
   read it back word for word. It is "O for oscar", never "O for osmium".
+- For email addresses always use confirm_email, never spell_back. Pass it
+  exactly what the caller said, including the words "at" and "dot" — it
+  converts them. Do not try to assemble the address yourself.
+- The word "at" is very often lost or misheard on a phone line, coming
+  through as "app", "paw", or nothing at all. If the address has no at
+  symbol, ask ONLY which part comes before the at. Never make the caller
+  repeat the whole address — asking three times in a row is why a caller
+  gives up.
+- When something fails twice, change the question. Ask for one small piece
+  instead of the whole thing again.
 - Always ask for the country code with a phone number.
 - Phone numbers often arrive split across two turns because the caller
   pauses. If a number looks short, do not use it — ask for the whole thing
@@ -108,7 +119,7 @@ Tool calls need YYYY-MM-DD, so convert before calling.
 7. Once they choose, call get_hotel_offers.
 8. Describe the room, the price, and the cancellation policy.
 9. If they want it, collect first name, surname, email, and phone number.
-   Ask for one at a time. Do not rush.
+   Ask for one at a time. Do not rush. Use confirm_email for the address.
 10. Call prepare_booking. This does not book anything — it checks the details
     and gives you a script to read back.
 11. Read the whole script back and ask if it is all correct.
@@ -144,6 +155,8 @@ class HotelBookingAgent(Agent):
         # number after confirming, and the agent silently created a second
         # reservation instead of amending the first.
         self._booked: dict[str, dict] = {}
+        # Set by confirm_email once an address has been parsed and validated.
+        self._email: str | None = None
 
     async def on_enter(self) -> None:
         self.session.generate_reply(
@@ -317,16 +330,52 @@ class HotelBookingAgent(Agent):
         text: str,
     ) -> str:
         """Get the exact phonetic script for reading something back to the
-        caller. Use this whenever you need to confirm a name, an email, or any
-        spelling. Never invent your own phonetic words — call this and read
-        what it returns, word for word.
+        caller. Use this to confirm a name or any spelling. Never invent your
+        own phonetic words — call this and read what it returns, word for word.
+
+        For email addresses use confirm_email instead, which parses the
+        spoken form properly.
 
         Args:
-            text: The word or address to spell out, e.g. "Kayode".
+            text: What to spell out. May be a word ("Kayode") or dictated
+                letters ("k a y o d e"); both are handled.
         """
+        # Words like "four" and "dot" must become characters first. Spelling
+        # the literal string reads "four" back as F-O-U-R, which is what
+        # made an earlier call unusable.
+        resolved = parse_spoken_text(text) if " " in text.strip() else text
         return (
-            f"Read this back exactly as written, word for word:\n"
-            f"{spell_phonetically(text)}"
+            f"This is '{resolved}'. Read the following back exactly as "
+            f"written, word for word:\n{spell_phonetically(resolved)}"
+        )
+
+    # ── Tool: email capture ──────────────────────────────────────────
+
+    @function_tool()
+    async def confirm_email(
+        self,
+        context: RunContext,
+        spoken_email: str,
+    ) -> str:
+        """Parse an email address the caller has dictated, and get a script
+        to read it back. Use this every time the caller gives or corrects
+        their email. Pass exactly what you heard, including words like "at",
+        "dot" and number words — this tool converts them.
+
+        Args:
+            spoken_email: What the caller said, e.g.
+                "k a y o d e at o four j dot co dot u k".
+        """
+        address, problem = parse_spoken_email(spoken_email)
+
+        if problem:
+            raise ToolError(problem)
+
+        self._email = address
+        return (
+            f"The address is {address}. Read this back exactly as written, "
+            f"word for word, then ask if it is correct:\n"
+            f"{spell_phonetically(address)}"
         )
 
     # ── Tool 3: Stage the booking and read it back ───────────────────
@@ -374,10 +423,14 @@ class HotelBookingAgent(Agent):
             if not ok:
                 raise ToolError(why)
 
-        email_clean = normalise_email(email)
+        # Prefer the address already parsed and confirmed by confirm_email.
+        # Re-parsing a spoken string here is how a mangled address slips in.
+        email_clean = self._email or parse_spoken_email(email)[0]
         ok, why = validate_email(email_clean)
         if not ok:
-            raise ToolError(why)
+            raise ToolError(
+                f"{why} Use confirm_email to capture the address first."
+            )
 
         phone_clean = normalise_phone(phone)
         ok, why = validate_phone(phone_clean)
