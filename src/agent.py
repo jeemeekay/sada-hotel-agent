@@ -84,6 +84,12 @@ wrong ruins the booking. So:
 - Never invent phonetic words. Call spell_back to get the correct script and
   read it back word for word. It is "O for oscar", never "O for osmium".
 - Always ask for the country code with a phone number.
+- Phone numbers often arrive split across two turns because the caller
+  pauses. If a number looks short, do not use it — ask for the whole thing
+  again and wait for them to finish. The tools will reject a short number.
+- If the caller corrects a detail after booking, call prepare_booking and
+  book_hotel_room again. This amends the existing reservation and keeps the
+  same reference. It does not create a second booking.
 - If the caller says a detail is wrong, ask only for the part that is wrong,
   not the whole thing again.
 
@@ -133,6 +139,11 @@ class HotelBookingAgent(Agent):
         # This makes it structurally impossible to book from a half-finished
         # turn, because the tool that writes takes no detail arguments.
         self._pending: dict | None = None
+        # Completed bookings, keyed by offer_id. Guards against booking the
+        # same room twice: on a real call the caller spotted a wrong phone
+        # number after confirming, and the agent silently created a second
+        # reservation instead of amending the first.
+        self._booked: dict[str, dict] = {}
 
     async def on_enter(self) -> None:
         self.session.generate_reply(
@@ -389,18 +400,24 @@ class HotelBookingAgent(Agent):
 
         return (
             "Details staged. Nothing is booked yet.\n"
-            "Read this back in TWO short turns, not one long one — a long "
-            "block takes too long to speak and the caller loses track.\n"
+            "Confirm these in THREE separate turns. Ask one question, wait "
+            "for the answer, then ask the next. Do not bundle them: a caller "
+            "asked to confirm three things at once will say yes to all of "
+            "them without checking each one.\n"
             f"Turn 1, the stay: {offer['hotel_name']}, "
             f"{offer['check_in']} to {offer['check_out']}, "
             f"{offer['currency']} {offer['price_total']} total. "
             "Ask if that is right.\n"
-            f"Turn 2, the contact details: the name {first_name} {last_name}, "
-            f"the phone number {' '.join(phone_clean)}, and the email read "
-            f"exactly as written here: {spell_phonetically(email_clean)}. "
-            "Ask if that is right.\n"
+            f"Turn 2, the phone number ONLY, digit by digit: "
+            f"{' '.join(phone_clean)}. Ask if that is right. Phone numbers "
+            "are the most common thing to get wrong, so give this its own "
+            "question.\n"
+            f"Turn 3, name and email: the name {first_name} {last_name}, and "
+            f"the email read exactly as written here: "
+            f"{spell_phonetically(email_clean)}. Ask if that is right.\n"
             "If anything is wrong, call prepare_booking again with the "
-            "correction. Once both are confirmed, call book_hotel_room."
+            "correction. Only when all three are confirmed, call "
+            "book_hotel_room."
         )
 
     # ── Tool 4: Commit the booking ───────────────────────────────────
@@ -436,6 +453,34 @@ class HotelBookingAgent(Agent):
         # confirmed in earlier turns, so this call is short and committed.
         context.disallow_interruptions()
 
+        # If this room is already booked, the caller is correcting something,
+        # not booking again. Amend in place and keep the original reference.
+        existing = self._booked.get(p["offer_id"])
+        if existing:
+            changed = [
+                field
+                for field in ("first_name", "last_name", "email", "phone")
+                if existing["details"].get(field) != p.get(field)
+            ]
+            existing["details"] = {k: p[k] for k in p}
+            self._pending = None
+
+            if not changed:
+                return (
+                    f"This room is already booked under reference "
+                    f"{existing['reference']}. Nothing has changed, so no "
+                    "second reservation was made. Reassure the caller they "
+                    "have one booking, not two, and read the reference back "
+                    "using spell_back."
+                )
+
+            return (
+                f"Booking {existing['reference']} has been AMENDED, not "
+                f"duplicated. Updated: {', '.join(changed)}. Tell the caller "
+                "their existing booking has been corrected and the reference "
+                "is unchanged, then read it back using spell_back."
+            )
+
         logger.info("Booking %s for %s %s", p["offer_id"], p["first_name"], p["last_name"])
 
         try:
@@ -459,8 +504,12 @@ class HotelBookingAgent(Agent):
                 "Apologise and suggest a different room."
             )
 
-        self._pending = None
         reference = result["booking_id"]
+        self._booked[p["offer_id"]] = {
+            "reference": reference,
+            "details": {k: p[k] for k in p},
+        }
+        self._pending = None
 
         return (
             f"Booked at {p['hotel_name']}.\n"

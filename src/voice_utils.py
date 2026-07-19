@@ -84,29 +84,78 @@ def normalise_phone(raw: str) -> str:
     return ("+" if plus else "") + digits
 
 
-def validate_phone(phone: str) -> tuple[bool, str]:
-    """Reject partial numbers and numbers without a country code.
+# National number lengths, excluding the country code. A UK mobile is
+# +44 then 10 digits; accepting anything shorter is how a truncated turn
+# ("plus four four seven five one seven two four seven zero") gets booked.
+NATIONAL_LENGTHS: dict[str, tuple[int, ...]] = {
+    "44": (10,),          # UK
+    "971": (9,),          # UAE
+    "1": (10,),           # US / Canada
+    "966": (9,),          # Saudi Arabia
+    "974": (8,),          # Qatar
+    "968": (8,),          # Oman
+    "965": (8,),          # Kuwait
+    "973": (8,),          # Bahrain
+    "20": (10,),          # Egypt
+    "234": (10,),         # Nigeria
+    "91": (10,),          # India
+    "33": (9,),           # France
+    "49": (10, 11),       # Germany
+    "353": (9,),          # Ireland
+}
 
-    A caller saying "plus four four" mid-sentence must never be accepted as a
-    complete number — that is exactly how a booking gets made against a
-    fragment of a turn. A number with no country code is equally useless to a
-    hotel that may be in another country.
+
+def _split_country_code(digits: str) -> tuple[str, str] | None:
+    """Split national digits from the country code, longest match first."""
+    for length in (3, 2, 1):
+        code = digits[:length]
+        if code in NATIONAL_LENGTHS:
+            return code, digits[length:]
+    return None
+
+
+def validate_phone(phone: str) -> tuple[bool, str]:
+    """Reject partial numbers, and numbers without a country code.
+
+    Two failure modes seen on real calls, both of which booked bad data:
+      - "plus four four" accepted as a whole number mid-sentence
+      - "+4475172470" accepted when the caller's final "five nine" landed
+        in the next turn
+    Checking the length against the country code catches the second.
     """
     digits = "".join(c for c in phone if c.isdigit())
+
     if not phone.startswith("+"):
         return False, (
             f"'{phone}' has no country code. Ask the caller which country "
             "their number is in, or for the dialling code, and include it. "
             "For the UK that is plus four four, for the UAE plus nine seven one."
         )
+
     if len(digits) < 8:
         return False, (
             f"'{phone}' is only {len(digits)} digits, which is an incomplete "
             "phone number. The caller was probably still speaking. Ask them "
             "for the full number and wait until they have finished."
         )
+
     if len(digits) > 15:
         return False, f"'{phone}' has too many digits to be a phone number."
+
+    split = _split_country_code(digits)
+    if split:
+        code, national = split
+        national = national.lstrip("0")  # 07517... -> 7517...
+        expected = NATIONAL_LENGTHS[code]
+        if len(national) not in expected:
+            want = " or ".join(str(e) for e in expected)
+            return False, (
+                f"'{phone}' has {len(national)} digits after the country code "
+                f"+{code}, but numbers in that country have {want}. The caller "
+                "was probably cut off. Ask them to give the whole number again "
+                "in one go, and wait until they stop speaking before you act."
+            )
+
     return True, ""
 
 
