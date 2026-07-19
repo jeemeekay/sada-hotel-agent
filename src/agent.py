@@ -157,6 +157,9 @@ class HotelBookingAgent(Agent):
         self._booked: dict[str, dict] = {}
         # Set by confirm_email once an address has been parsed and validated.
         self._email: str | None = None
+        # Escalation counter: repeating the same question after it has failed
+        # twice is what turns a booking into an eleven-minute call.
+        self._email_attempts = 0
 
     async def on_enter(self) -> None:
         self.session.generate_reply(
@@ -356,6 +359,7 @@ class HotelBookingAgent(Agent):
         self,
         context: RunContext,
         spoken_email: str,
+        caller_rejected_previous: bool = False,
     ) -> str:
         """Parse an email address the caller has dictated, and get a script
         to read it back. Use this every time the caller gives or corrects
@@ -365,13 +369,46 @@ class HotelBookingAgent(Agent):
         Args:
             spoken_email: What the caller said, e.g.
                 "k a y o d e at o four j dot co dot u k".
+            caller_rejected_previous: Set True if the caller just said the
+                address you read back was wrong. This matters: an address can
+                parse perfectly and still be the wrong address.
         """
+        if caller_rejected_previous:
+            self._email_attempts += 1
+
         address, problem = parse_spoken_email(spoken_email)
 
         if problem:
+            self._email_attempts += 1
+            # Spelling letter by letter degrades badly on a phone line. After
+            # two failures, stop asking for letters and ask for the domain as
+            # a whole word instead — "o4j.co.uk" survives where "o, four, j"
+            # does not.
+            if self._email_attempts >= 3:
+                raise ToolError(
+                    f"{problem}\n\nThis has now failed "
+                    f"{self._email_attempts} times, so change approach. Do "
+                    "not ask for more letters. Ask the caller to say the part "
+                    "after the at symbol as a whole word, the way they would "
+                    "say it to a person — for example 'gmail dot com' or "
+                    "'o four j dot co dot uk'. If that also fails, offer to "
+                    "take the booking without an email."
+                )
             raise ToolError(problem)
 
         self._email = address
+
+        if self._email_attempts >= 3:
+            return (
+                f"The address is {address}. Read this back exactly as "
+                f"written, word for word:\n{spell_phonetically(address)}\n\n"
+                f"This has been rejected {self._email_attempts} times. If it "
+                "is wrong again, stop asking for letters — ask the caller to "
+                "say the part after the at symbol as a whole word, the way "
+                "they would to a person, for example 'gmail dot com'. If that "
+                "fails too, offer to complete the booking without an email."
+            )
+
         return (
             f"The address is {address}. Read this back exactly as written, "
             f"word for word, then ask if it is correct:\n"
@@ -453,10 +490,11 @@ class HotelBookingAgent(Agent):
 
         return (
             "Details staged. Nothing is booked yet.\n"
-            "Confirm these in THREE separate turns. Ask one question, wait "
-            "for the answer, then ask the next. Do not bundle them: a caller "
-            "asked to confirm three things at once will say yes to all of "
-            "them without checking each one.\n"
+            "Confirm these in FOUR separate turns. Ask one question, wait "
+            "for the answer, then ask the next. Never bundle two of them into "
+            "one question: a caller asked to confirm a name and an email "
+            "together will say yes to both, and a wrong name goes through "
+            "unnoticed.\n"
             f"Turn 1, the stay: {offer['hotel_name']}, "
             f"{offer['check_in']} to {offer['check_out']}, "
             f"{offer['currency']} {offer['price_total']} total. "
@@ -465,11 +503,15 @@ class HotelBookingAgent(Agent):
             f"{' '.join(phone_clean)}. Ask if that is right. Phone numbers "
             "are the most common thing to get wrong, so give this its own "
             "question.\n"
-            f"Turn 3, name and email: the name {first_name} {last_name}, and "
-            f"the email read exactly as written here: "
+            f"Turn 3, the NAME ONLY, spelled out: "
+            f"{spell_phonetically(first_name)}, then "
+            f"{spell_phonetically(last_name)}. Ask if that is right. Spell it "
+            "rather than saying it — a misheard letter in a surname is "
+            "invisible when the name is merely spoken.\n"
+            f"Turn 4, the EMAIL ONLY, read exactly as written here: "
             f"{spell_phonetically(email_clean)}. Ask if that is right.\n"
             "If anything is wrong, call prepare_booking again with the "
-            "correction. Only when all three are confirmed, call "
+            "correction. Only when all four are confirmed, call "
             "book_hotel_room."
         )
 

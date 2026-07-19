@@ -76,14 +76,6 @@ def validate_email(email: str) -> tuple[bool, str]:
     return True, ""
 
 
-def normalise_phone(raw: str) -> str:
-    """Strip everything except digits and a leading plus."""
-    cleaned = raw.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    plus = cleaned.startswith("+")
-    digits = "".join(c for c in cleaned if c.isdigit())
-    return ("+" if plus else "") + digits
-
-
 # National number lengths, excluding the country code. A UK mobile is
 # +44 then 10 digits; accepting anything shorter is how a truncated turn
 # ("plus four four seven five one seven two four seven zero") gets booked.
@@ -112,6 +104,29 @@ def _split_country_code(digits: str) -> tuple[str, str] | None:
         if code in NATIONAL_LENGTHS:
             return code, digits[length:]
     return None
+
+
+def normalise_phone(raw: str) -> str:
+    """Normalise to international form, dropping the national trunk prefix.
+
+    Callers naturally give the domestic form and the country code separately:
+    "zero seven five one seven... and the code is plus four four". Joined
+    literally that becomes +4407517247059, which is not a valid number — the
+    leading 0 is a domestic trunk prefix and must be dropped when a country
+    code is present.
+    """
+    cleaned = raw.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    plus = cleaned.startswith("+")
+    digits = "".join(c for c in cleaned if c.isdigit())
+
+    if plus:
+        split = _split_country_code(digits)
+        if split:
+            code, national = split
+            national = national.lstrip("0")
+            digits = code + national
+
+    return ("+" if plus else "") + digits
 
 
 def validate_phone(phone: str) -> tuple[bool, str]:
