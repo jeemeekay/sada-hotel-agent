@@ -41,6 +41,14 @@ from hotel_client import (
     search_offers,
     book_hotel,
 )
+from voice_utils import (
+    normalise_email,
+    normalise_phone,
+    spell_phonetically,
+    validate_email,
+    validate_name,
+    validate_phone,
+)
 
 load_dotenv()
 
@@ -56,46 +64,55 @@ def build_instructions() -> str:
 callers over the phone and help them find and reserve hotel rooms.
 
 # Voice output rules (critical)
-Your replies are converted to speech. Therefore:
-- Never say IDs, codes, or anything in square brackets out loud. Hotel IDs \
-and offer IDs are for your internal use only — the caller must never hear them.
-- No markdown, asterisks, bullets, or emoji. Speak in plain sentences.
-- Keep replies to one or two sentences. This is a conversation, not a document.
-- Say prices naturally: "one hundred and eighty dollars a night", not "USD 180".
+Your replies are spoken aloud. Therefore:
+- Never say IDs or codes out loud. Hotel IDs and offer IDs are internal.
+- No markdown, asterisks, bullets, or emoji. Plain sentences only.
+- Keep replies to one or two sentences unless reading details back.
+- Say prices naturally: "one hundred and eighty dollars", not "USD 180".
 - Say dates naturally: "the twenty-fifth of July", not "2026-07-25".
 
-# Your manner
-Professional, warm, and efficient. Confirm details back to the caller before \
-you act on them. Do not ramble.
+# Handling names, emails and phone numbers
+These are the hardest things to get right over a phone line, and getting one
+wrong ruins the booking. So:
+- Wait for the caller to finish. A number like "plus four four" is the start
+  of a sentence, not a phone number. Never act on a fragment.
+- When you read an email or a reference back, spell it phonetically:
+  "K for kilo, A for alpha". Never say the letters bare — they do not survive
+  a phone line. The tools give you the exact script to read; use it verbatim.
+- If the caller says a detail is wrong, ask only for the part that is wrong,
+  not the whole thing again.
+- If a name arrives as separate letters, join them into a word and confirm.
 
 # Today's date
-Today is {today}. Use this to resolve relative dates like "next Friday" or \
-"this weekend". Tool calls always require dates in YYYY-MM-DD format, so \
-convert before calling.
+Today is {today}. Use it to resolve relative dates like "next Friday".
+Tool calls need YYYY-MM-DD, so convert before calling.
 
-# Booking flow
+# Booking flow, in order
 1. Greet the caller and ask how you can help.
-2. Find out which city they want to stay in.
-3. Find out their check-in and check-out dates.
-4. Find out how many adults are travelling. Assume one if they don't say.
-5. Call search_hotels_in_city to find hotels.
-6. Read out three to five hotel names and let the caller pick one. Do not read \
-the IDs.
-7. Call get_hotel_offers with the chosen hotel's ID and the dates.
-8. Describe the room and the price. Mention the cancellation policy briefly.
-9. If they want to book, collect their first name, last name, email, and \
-phone number. Read the email back to confirm you heard it correctly.
-10. Call book_hotel_room. Then read out the booking reference slowly, \
-character by character, since references are hard to hear over the phone.
+2. Ask which city.
+3. Ask which nights they want to stay. You MUST ask. Never assume dates,
+   never default to tonight or tomorrow.
+4. Ask how many adults. Assume one only if they decline to say.
+5. Call search_hotels_in_city.
+6. Read out three to five hotel names. Never read IDs.
+7. Once they choose, call get_hotel_offers.
+8. Describe the room, the price, and the cancellation policy.
+9. If they want it, collect first name, surname, email, and phone number.
+   Ask for one at a time. Do not rush.
+10. Call prepare_booking. This does not book anything — it checks the details
+    and gives you a script to read back.
+11. Read the whole script back and ask if it is all correct.
+12. Only when they confirm, call book_hotel_room with caller_confirmed set
+    to true. Then read the reference back phonetically.
 
 # Rules
-- Never invent a hotel name, a price, or an availability. Only state what the \
-tools return.
-- If a tool reports an error, tell the caller plainly and offer an alternative.
-- Before booking, mention that this is a demonstration booking and no real \
-charge will be made.
-- If the caller wants something unrelated to hotels, politely say that hotel \
-bookings are all you can help with."""
+- Never invent a hotel name, price, availability, or date. Only state what
+  the tools return.
+- If a tool returns an error, it is telling you how to recover. Follow it.
+- Before booking, say this is a demonstration and no real charge is made.
+- Never claim a confirmation email has been sent. None is.
+- If the caller wants something unrelated to hotels, say politely that hotel
+  bookings are all you can help with."""
 
 
 # ── Agent ────────────────────────────────────────────────────────────
@@ -107,6 +124,11 @@ class HotelBookingAgent(Agent):
         # so these are safe as plain instance attributes.
         self._hotels: dict[str, dict] = {}
         self._offers: dict[str, dict] = {}
+        # Booking is a two-step commit. prepare_booking() validates and stages
+        # the details here; book_hotel_room() can only act on what is staged.
+        # This makes it structurally impossible to book from a half-finished
+        # turn, because the tool that writes takes no detail arguments.
+        self._pending: dict | None = None
 
     async def on_enter(self) -> None:
         self.session.generate_reply(
@@ -170,18 +192,28 @@ class HotelBookingAgent(Agent):
         hotel_ids: str,
         check_in: str,
         check_out: str,
+        caller_stated_dates: bool,
         adults: int = 1,
     ) -> str:
         """Get available rooms and prices for one or more hotels. Call this
-        after the caller has chosen a hotel and given you their dates.
+        after the caller has chosen a hotel AND told you their dates.
 
         Args:
             hotel_ids: One or more hotel id values from search_hotels_in_city,
                 separated by commas if there is more than one.
             check_in: Check-in date, formatted as YYYY-MM-DD.
             check_out: Check-out date, formatted as YYYY-MM-DD.
+            caller_stated_dates: True only if the caller actually told you
+                these dates. False if you guessed, assumed, or defaulted them.
+                Never choose dates on the caller's behalf.
             adults: Number of adults staying. Defaults to 1.
         """
+        if not caller_stated_dates:
+            raise ToolError(
+                "The caller has not given you dates yet. Ask which nights "
+                "they want to stay, then call this again. Do not invent dates."
+            )
+
         ids = [h.strip() for h in hotel_ids.split(",") if h.strip()]
         if not ids:
             raise ToolError("No hotel id was provided. Search for hotels first.")
@@ -261,10 +293,10 @@ class HotelBookingAgent(Agent):
         )
         return "\n".join(lines)
 
-    # ── Tool 3: Book a room ──────────────────────────────────────────
+    # ── Tool 3: Stage the booking and read it back ───────────────────
 
     @function_tool()
-    async def book_hotel_room(
+    async def prepare_booking(
         self,
         context: RunContext,
         offer_id: str,
@@ -273,35 +305,110 @@ class HotelBookingAgent(Agent):
         email: str,
         phone: str,
     ) -> str:
-        """Reserve a room. Only call this once the caller has explicitly
-        confirmed they want to book, and you have all their contact details.
+        """Validate the caller's details and stage the booking for
+        confirmation. This does NOT book anything. Call it once you believe
+        you have all four contact details. It returns a script to read back
+        to the caller.
 
         Args:
             offer_id: The offer_id value from get_hotel_offers.
-            first_name: The guest's first name.
-            last_name: The guest's last name.
+            first_name: The guest's first name, as a whole word.
+            last_name: The guest's surname, as a whole word.
             email: The guest's email address.
-            phone: The guest's phone number, including country code.
+            phone: The guest's full phone number including country code.
         """
-        # Booking writes to an external system and cannot be rolled back,
-        # so block interruptions until it completes.
-        context.disallow_interruptions()
-
-        if offer_id not in self._offers and self._offers:
+        if offer_id not in self._offers:
             raise ToolError(
                 "That offer is not one of the options presented. Call "
-                "get_hotel_offers again and re-confirm the choice with the caller."
+                "get_hotel_offers again and confirm the choice with the caller."
             )
 
-        logger.info("Booking offer %s for %s %s", offer_id, first_name, last_name)
+        for value, field in ((first_name, "first name"), (last_name, "surname")):
+            ok, why = validate_name(value, field)
+            if not ok:
+                raise ToolError(why)
+
+        email_clean = normalise_email(email)
+        ok, why = validate_email(email_clean)
+        if not ok:
+            raise ToolError(why)
+
+        phone_clean = normalise_phone(phone)
+        ok, why = validate_phone(phone_clean)
+        if not ok:
+            raise ToolError(why)
+
+        offer = self._offers[offer_id]
+        self._pending = {
+            "offer_id": offer_id,
+            "first_name": first_name.strip(),
+            "last_name": last_name.strip(),
+            "email": email_clean,
+            "phone": phone_clean,
+            "hotel_name": offer["hotel_name"],
+            "check_in": offer["check_in"],
+            "check_out": offer["check_out"],
+            "price_total": offer["price_total"],
+            "currency": offer["currency"],
+        }
+
+        return (
+            "Details staged. Nothing is booked yet. Read ALL of the following "
+            "back to the caller, then ask if everything is correct:\n"
+            f"- Hotel: {offer['hotel_name']}\n"
+            f"- Checking in {offer['check_in']}, checking out {offer['check_out']}\n"
+            f"- Total: {offer['currency']} {offer['price_total']}\n"
+            f"- Name: {first_name} {last_name}\n"
+            f"- Email, spell this out exactly as written here: "
+            f"{spell_phonetically(email_clean)}\n"
+            f"- Phone: {' '.join(phone_clean)}\n"
+            "If the caller corrects anything, call prepare_booking again with "
+            "the corrected details. Only once they confirm everything is "
+            "right, call book_hotel_room."
+        )
+
+    # ── Tool 4: Commit the booking ───────────────────────────────────
+
+    @function_tool()
+    async def book_hotel_room(
+        self,
+        context: RunContext,
+        caller_confirmed: bool,
+    ) -> str:
+        """Complete the reservation using the details staged by
+        prepare_booking. Only call this after you have read the details back
+        and the caller has explicitly said they are correct.
+
+        Args:
+            caller_confirmed: True only if the caller has just confirmed, in
+                their own words, that the details you read back are correct.
+        """
+        if self._pending is None:
+            raise ToolError(
+                "No booking has been staged. Call prepare_booking first and "
+                "read the details back to the caller."
+            )
+
+        if not caller_confirmed:
+            raise ToolError(
+                "The caller has not confirmed yet. Read the staged details "
+                "back and wait for them to say they are correct."
+            )
+
+        p = self._pending
+        # Safe to block interruptions now: everything was validated and
+        # confirmed in earlier turns, so this call is short and committed.
+        context.disallow_interruptions()
+
+        logger.info("Booking %s for %s %s", p["offer_id"], p["first_name"], p["last_name"])
 
         try:
             result = book_hotel(
-                offer_id=offer_id,
-                guest_first_name=first_name,
-                guest_last_name=last_name,
-                guest_email=email,
-                guest_phone=phone,
+                offer_id=p["offer_id"],
+                guest_first_name=p["first_name"],
+                guest_last_name=p["last_name"],
+                guest_email=p["email"],
+                guest_phone=p["phone"],
             )
         except Exception:
             logger.exception("Booking failed")
@@ -316,15 +423,16 @@ class HotelBookingAgent(Agent):
                 "Apologise and suggest a different room."
             )
 
-        offer = self._offers.get(offer_id, {})
-        hotel = offer.get("hotel_name", "the hotel")
+        self._pending = None
+        reference = result["booking_id"]
 
         return (
-            f"Booking confirmed at {hotel}. "
-            f"Reference: {result['booking_id']}. "
-            f"Status: {result['status']}. "
-            "Read the reference back slowly, one character at a time, then "
-            "confirm a copy has been sent to the caller's email."
+            f"Booked at {p['hotel_name']}.\n"
+            f"Reference, read it back exactly like this: "
+            f"{spell_phonetically(reference)}\n"
+            "Do not claim a confirmation email has been sent — none is sent "
+            "in this demonstration. Tell the caller to write the reference "
+            "down instead."
         )
 
 
@@ -341,7 +449,9 @@ async def entrypoint(ctx: JobContext) -> None:
         # All three models run through LiveKit Inference. The only
         # credentials needed are LIVEKIT_URL / API_KEY / API_SECRET.
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
-        llm=inference.LLM(model="google/gemini-2.5-flash"),
+        # gpt-4.1-mini chosen over gemini-2.5-flash for time-to-first-token;
+        # on a phone call the caller hears every extra second as dead air.
+        llm=inference.LLM(model="openai/gpt-4.1-mini"),
         tts=inference.TTS(
             model="cartesia/sonic-3",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",

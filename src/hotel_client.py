@@ -248,8 +248,9 @@ def _mock_search_offers(
         per_night = pricing["min"] + (seed % (pricing["max"] - pricing["min"]))
         total = per_night * nights
 
-        # Cancellation deadline: 3 days before check-in
-        cancel_date = ci - timedelta(days=3)
+        # Cancellation deadline: 3 days before check-in, but never in the
+        # past — quoting an expired deadline to a caller is nonsense.
+        cancel_date = max(ci - timedelta(days=3), datetime.now())
 
         offer_id = f"OFF-{hotel_id}-{check_in.replace('-', '')}"
         offers.append({
