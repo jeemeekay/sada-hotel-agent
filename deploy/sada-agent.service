@@ -1,0 +1,35 @@
+# /etc/systemd/system/sada-agent.service
+#
+# The voice agent. Uses `start`, not `dev`: start pre-warms job processes
+# based on CPU count, so a visitor is not waiting for a cold process to boot.
+
+[Unit]
+Description=SADA hotel booking voice agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sada
+WorkingDirectory=/opt/sada-hotel-agent
+EnvironmentFile=/opt/sada-hotel-agent/.env
+Environment=SADA_LOG_DIR=/var/log/sada/sessions
+ExecStart=/opt/sada-hotel-agent/.venv/bin/python src/agent.py start
+Restart=always
+RestartSec=5
+
+# Sessions are stateful. Give in-progress conversations time to finish
+# rather than cutting someone off mid-booking on a restart.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/sada
+
+[Install]
+WantedBy=multi-user.target

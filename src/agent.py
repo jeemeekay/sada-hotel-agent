@@ -17,6 +17,7 @@ Run:
     uv run src/agent.py console   # terminal-only, no room needed
 """
 
+import inspect
 import logging
 from datetime import date, datetime
 
@@ -41,8 +42,15 @@ from hotel_client import (
     search_offers,
     book_hotel,
 )
+from session_log import (
+    SessionLogger,
+    attach_debug_log,
+    detach_debug_log,
+    session_slug,
+)
 from voice_utils import (
     letters_to_word,
+    name_matches_email,
     normalise_phone,
     parse_spoken_email,
     parse_spoken_text,
@@ -160,6 +168,25 @@ class HotelBookingAgent(Agent):
         # Escalation counter: repeating the same question after it has failed
         # twice is what turns a booking into an eleven-minute call.
         self._email_attempts = 0
+        # Name/email pairs already queried once. A caller whose address
+        # genuinely differs from their name should not be trapped in a loop,
+        # so the second attempt with the same values is allowed through.
+        self._name_email_queried: set[tuple[str, str]] = set()
+        # Set by the entrypoint. Tools write to it so the transcript shows
+        # not just what was said, but what the agent actually did and which
+        # guards fired.
+        self.log: SessionLogger | None = None
+
+    def _rejected(self, message: str) -> ToolError:
+        """Record a guard firing, then hand back the error to raise.
+
+        Rejections are the most informative lines in a transcript: they show
+        which safeguard caught what, and how the agent was told to recover.
+        """
+        if self.log:
+            caller = inspect.stack()[1].function
+            self.log.tool_error(caller, message)
+        return ToolError(message)
 
     async def on_enter(self) -> None:
         self.session.generate_reply(
@@ -184,17 +211,19 @@ class HotelBookingAgent(Agent):
             city: The city name, for example "Dubai", "London", or "Paris".
         """
         logger.info("Searching hotels in %s", city)
+        if self.log:
+            self.log.tool("search_hotels_in_city", city=city)
 
         city_code = resolve_city_code(city)
         if not city_code:
-            raise ToolError(
+            raise self._rejected(
                 f"'{city}' is not a supported city. Ask the caller for a major "
                 "city such as Dubai, Abu Dhabi, London, Paris, or New York."
             )
 
         hotels = search_hotels(city_code, max_results=6)
         if not hotels:
-            raise ToolError(
+            raise self._rejected(
                 f"No hotels are available in {city} right now. Ask the caller "
                 "to try a different city."
             )
@@ -240,14 +269,14 @@ class HotelBookingAgent(Agent):
             adults: Number of adults staying. Defaults to 1.
         """
         if not caller_stated_dates:
-            raise ToolError(
+            raise self._rejected(
                 "The caller has not given you dates yet. Ask which nights "
                 "they want to stay, then call this again. Do not invent dates."
             )
 
         ids = [h.strip() for h in hotel_ids.split(",") if h.strip()]
         if not ids:
-            raise ToolError("No hotel id was provided. Search for hotels first.")
+            raise self._rejected("No hotel id was provided. Search for hotels first.")
 
         # Validate format before comparing. A plain string comparison would
         # silently misreport a malformed date as a date-ordering problem.
@@ -255,25 +284,28 @@ class HotelBookingAgent(Agent):
             ci = datetime.strptime(check_in, "%Y-%m-%d").date()
             co = datetime.strptime(check_out, "%Y-%m-%d").date()
         except ValueError:
-            raise ToolError(
+            raise self._rejected(
                 "Dates must be in YYYY-MM-DD format. Convert the caller's "
                 f"dates and call again. Received check_in={check_in!r}, "
                 f"check_out={check_out!r}."
             )
 
         if co <= ci:
-            raise ToolError(
+            raise self._rejected(
                 "The check-out date must be after the check-in date. Ask the "
                 "caller to confirm their dates."
             )
 
         if ci < date.today():
-            raise ToolError(
+            raise self._rejected(
                 "That check-in date is in the past. Ask the caller which "
                 "upcoming dates they mean."
             )
 
         logger.info("Fetching offers for %s, %s to %s", ids, check_in, check_out)
+        if self.log:
+            self.log.tool("get_hotel_offers", hotels=ids, check_in=check_in,
+                          check_out=check_out, adults=adults)
 
         try:
             offers = search_offers(
@@ -285,16 +317,16 @@ class HotelBookingAgent(Agent):
         except ValueError as e:
             # Malformed dates from the LLM — tell it exactly what went wrong
             # so it can retry with the correct format.
-            raise ToolError(str(e))
+            raise self._rejected(str(e))
         except Exception:
             logger.exception("Offer search failed")
-            raise ToolError(
+            raise self._rejected(
                 "The booking system did not respond. Ask the caller if they "
                 "would like you to try again."
             )
 
         if not offers:
-            raise ToolError(
+            raise self._rejected(
                 "No rooms are available at that hotel for those dates. Suggest "
                 "different dates or another hotel from the list."
             )
@@ -373,6 +405,10 @@ class HotelBookingAgent(Agent):
                 address you read back was wrong. This matters: an address can
                 parse perfectly and still be the wrong address.
         """
+        if self.log:
+            self.log.tool("confirm_email", heard=spoken_email,
+                          rejected_previous=caller_rejected_previous)
+
         if caller_rejected_previous:
             self._email_attempts += 1
 
@@ -385,7 +421,7 @@ class HotelBookingAgent(Agent):
             # a whole word instead — "o4j.co.uk" survives where "o, four, j"
             # does not.
             if self._email_attempts >= 3:
-                raise ToolError(
+                raise self._rejected(
                     f"{problem}\n\nThis has now failed "
                     f"{self._email_attempts} times, so change approach. Do "
                     "not ask for more letters. Ask the caller to say the part "
@@ -394,9 +430,11 @@ class HotelBookingAgent(Agent):
                     "'o four j dot co dot uk'. If that also fails, offer to "
                     "take the booking without an email."
                 )
-            raise ToolError(problem)
+            raise self._rejected(problem)
 
         self._email = address
+        if self.log:
+            self.log.note(f"email resolved to {address}")
 
         if self._email_attempts >= 3:
             return (
@@ -449,8 +487,11 @@ class HotelBookingAgent(Agent):
         # spelled out K-A-Y-O-D-E.
         first_name = letters_to_word(first_name_spelling)
         last_name = letters_to_word(last_name_spelling)
+        if self.log:
+            self.log.tool("prepare_booking", name=f"{first_name} {last_name}",
+                          email=email, phone=phone)
         if offer_id not in self._offers:
-            raise ToolError(
+            raise self._rejected(
                 "That offer is not one of the options presented. Call "
                 "get_hotel_offers again and confirm the choice with the caller."
             )
@@ -458,21 +499,31 @@ class HotelBookingAgent(Agent):
         for value, field in ((first_name, "first name"), (last_name, "surname")):
             ok, why = validate_name(value, field)
             if not ok:
-                raise ToolError(why)
+                raise self._rejected(why)
 
         # Prefer the address already parsed and confirmed by confirm_email.
         # Re-parsing a spoken string here is how a mangled address slips in.
         email_clean = self._email or parse_spoken_email(email)[0]
         ok, why = validate_email(email_clean)
         if not ok:
-            raise ToolError(
+            raise self._rejected(
                 f"{why} Use confirm_email to capture the address first."
             )
 
         phone_clean = normalise_phone(phone)
         ok, why = validate_phone(phone_clean)
         if not ok:
-            raise ToolError(why)
+            raise self._rejected(why)
+
+        # A spelled name and a spoken email are two independent captures of
+        # the same person. When they nearly agree, one of them was misheard —
+        # and a booking went out as "Teyode Olajide" against kayode@... for
+        # exactly this reason, with nothing to catch it.
+        pair = (first_name.lower(), email_clean)
+        ok, why = name_matches_email(first_name, email_clean)
+        if not ok and pair not in self._name_email_queried:
+            self._name_email_queried.add(pair)
+            raise self._rejected(why)
 
         offer = self._offers[offer_id]
         self._pending = {
@@ -532,18 +583,22 @@ class HotelBookingAgent(Agent):
                 their own words, that the details you read back are correct.
         """
         if self._pending is None:
-            raise ToolError(
+            raise self._rejected(
                 "No booking has been staged. Call prepare_booking first and "
                 "read the details back to the caller."
             )
 
         if not caller_confirmed:
-            raise ToolError(
+            raise self._rejected(
                 "The caller has not confirmed yet. Read the staged details "
                 "back and wait for them to say they are correct."
             )
 
         p = self._pending
+        if self.log:
+            self.log.tool("book_hotel_room", name=f"{p['first_name']} {p['last_name']}",
+                          email=p["email"], phone=p["phone"], hotel=p["hotel_name"])
+
         # Safe to block interruptions now: everything was validated and
         # confirmed in earlier turns, so this call is short and committed.
         context.disallow_interruptions()
@@ -569,6 +624,11 @@ class HotelBookingAgent(Agent):
                     "using spell_back."
                 )
 
+            if self.log:
+                self.log.outcome(
+                    f"AMENDED {existing['reference']} — changed: {', '.join(changed)}",
+                    reference=existing["reference"],
+                )
             return (
                 f"Booking {existing['reference']} has been AMENDED, not "
                 f"duplicated. Updated: {', '.join(changed)}. Tell the caller "
@@ -588,18 +648,24 @@ class HotelBookingAgent(Agent):
             )
         except Exception:
             logger.exception("Booking failed")
-            raise ToolError(
+            raise self._rejected(
                 "The booking could not be completed. Apologise and offer to "
                 "try again."
             )
 
         if not result.get("success"):
-            raise ToolError(
+            raise self._rejected(
                 f"The booking was declined: {result.get('error', 'unknown reason')}. "
                 "Apologise and suggest a different room."
             )
 
         reference = result["booking_id"]
+        if self.log:
+            self.log.outcome(
+                f"BOOKED {p['hotel_name']} for {p['first_name']} {p['last_name']} "
+                f"({p['email']}, {p['phone']})",
+                reference=reference,
+            )
         self._booked[p["offer_id"]] = {
             "reference": reference,
             "details": {k: p[k] for k in p},
@@ -625,12 +691,20 @@ server = AgentServer()
 async def entrypoint(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
 
+    # One set of log files per conversation. Each job is its own process, so
+    # the root-logger handler below only ever sees this session.
+    slug = session_slug(ctx.room.name)
+    debug_handler = attach_debug_log(slug)
+    agent = HotelBookingAgent()
+    agent.log = SessionLogger(slug, room=ctx.room.name)
+    logger.info("session transcript: %s", agent.log.path)
+
     session = AgentSession(
         # All three models run through LiveKit Inference. The only
         # credentials needed are LIVEKIT_URL / API_KEY / API_SECRET.
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
         # gpt-4.1-mini chosen over gemini-2.5-flash for time-to-first-token;
-        # on a phone call the caller hears every extra second as dead air.
+        # the caller hears every extra second as dead air.
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
         tts=inference.TTS(
             model="cartesia/sonic-3",
@@ -638,25 +712,57 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         turn_handling=TurnHandlingOptions(
             interruption={
-                # Phone lines are noisy; don't let background sound
-                # permanently cut the agent off mid-sentence.
+                # Browser mics are cleaner than phone lines, but background
+                # noise should still not cut the agent off permanently.
                 "resume_false_interruption": True,
                 "false_interruption_timeout": 1.0,
             },
-            # Start generating before the caller fully stops speaking.
             preemptive_generation={"enabled": True, "max_retries": 3},
         ),
-        # Give the client 3s to calibrate echo cancellation before the
-        # agent can be interrupted.
         aec_warmup_duration=3.0,
-        # Tool results contain ids and punctuation that must never be spoken.
         tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
 
-    await session.start(
-        agent=HotelBookingAgent(),
-        room=ctx.room,
-    )
+    @session.on("conversation_item_added")
+    def _on_item(event) -> None:
+        item = getattr(event, "item", None)
+        if item is None:
+            return
+        text = getattr(item, "text_content", None) or ""
+        role = getattr(item, "role", "")
+        if text and role in ("user", "assistant"):
+            agent.log.turn(role, text)
+
+    @session.on("metrics_collected")
+    def _on_metrics(event) -> None:
+        # Field names vary across metric types and releases, so read
+        # defensively — a missing attribute must never break a call.
+        m = getattr(event, "metrics", event)
+        parts = {}
+        ttft = getattr(m, "ttft", None)
+        if ttft and ttft > 0:
+            parts["llm first token"] = f"{ttft:.2f}s"
+        ttfb = getattr(m, "ttfb", None)
+        if ttfb and ttfb > 0:
+            parts["tts first byte"] = f"{ttfb:.2f}s"
+        eou = getattr(m, "end_of_utterance_delay", None)
+        if eou and eou > 0:
+            parts["end of turn"] = f"{eou:.2f}s"
+        if parts:
+            agent.log.timing(**parts)
+
+    @session.on("error")
+    def _on_error(event) -> None:
+        agent.log.note(f"SESSION ERROR: {event}")
+        logger.error("session error: %s", event)
+
+    async def _shutdown() -> None:
+        agent.log.close(reason="session ended")
+        detach_debug_log(debug_handler)
+
+    ctx.add_shutdown_callback(_shutdown)
+
+    await session.start(agent=agent, room=ctx.room)
 
 
 if __name__ == "__main__":

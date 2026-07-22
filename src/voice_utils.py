@@ -296,3 +296,47 @@ def parse_spoken_email(spoken: str) -> tuple[str, str]:
         return address, why
 
     return address, ""
+
+
+def name_matches_email(first_name: str, email: str) -> tuple[bool, str]:
+    """Cross-check a spelled name against the email address.
+
+    People overwhelmingly put their own first name in their email address,
+    so the two are a free check on each other. A caller who spells
+    "K-A-Y-O-D-E" and gives kayode@... is consistent; one whose name comes
+    through as "Teyode" against the same address has been misheard, and the
+    address is the more reliable of the two because it was spoken as a whole
+    rather than letter by letter.
+
+    Returns (looks_consistent, reason). Similar-but-different is the
+    suspicious case — completely unrelated is normal and passes, since
+    plenty of people use nicknames or shared addresses.
+    """
+    from difflib import SequenceMatcher
+
+    local = email.split("@")[0].lower()
+    local = "".join(c for c in local if c.isalpha())
+    name = "".join(c for c in first_name.lower() if c.isalpha())
+
+    if not local or not name or len(name) < 3:
+        return True, ""
+
+    if name in local or local in name:
+        return True, ""
+
+    similarity = SequenceMatcher(None, name, local).ratio()
+
+    # 0.6 catches one or two wrong letters in a short name without
+    # flagging genuinely different words.
+    if similarity >= 0.6:
+        return False, (
+            f"The name '{first_name.capitalize()}' and the email address "
+            f"'{email}' are close but not the same, which usually means one "
+            "letter was misheard while spelling. The email is more reliable "
+            "because it was said as a whole word. Ask the caller to confirm "
+            "the spelling of their first name once more, slowly. If they "
+            "confirm the name as you have it, call prepare_booking again "
+            "with the same values and it will go through."
+        )
+
+    return True, ""

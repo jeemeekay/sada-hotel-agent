@@ -1,7 +1,7 @@
 [project]
 name = "sada-hotel-agent"
 version = "0.1.0"
-description = "SADA Hotel Booking Voice Agent — LiveKit + Amadeus Self-Service API"
+description = "SADA Hotel Booking Voice Agent — LiveKit voice agent with web client"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
