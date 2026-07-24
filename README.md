@@ -1,107 +1,95 @@
 # SADA Hotel Booking Voice Agent
 
-A LiveKit voice agent that books hotel rooms by voice. Users call in (SIP or WebRTC), speak naturally, and the agent searches hotels, presents options, and completes reservations.
+A voice AI agent that books hotel rooms through natural conversation. Built on [LiveKit](https://livekit.io) for real-time audio and [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) for speech-to-speech processing.
 
-## Architecture
+Try it: [sada.sh/sada-hotel-agent.html](https://sada.sh/sada-hotel-agent.html)
 
-```
-Caller → LiveKit (WebRTC/SIP) → Agent
-                                  │
-                          ┌───────┴────────┐
-                          │   STT          │  Deepgram Nova-3
-                          │   LLM          │  Anthropic Claude
-                          │   TTS          │  Cartesia Sonic
-                          └───────┬────────┘
-                                  │
-                          ┌───────┴────────┐
-                          │  Hotel API     │
-                          │  (mock or      │  → find hotels by city
-                          │   Hotelbeds)   │  → get rooms & prices
-                          │                │  → create reservation
-                          └────────────────┘
-```
+## How it works
 
-## Conversation Flow
+You speak, SADA listens. Tell it a city, dates, and how many guests. It searches hotels, reads out options, and books the one you choose — collecting your name, email, and phone along the way. The entire interaction happens by voice.
 
-1. Agent greets the caller
-2. Collects city, dates, and number of guests
-3. Searches hotels → reads out options
-4. Caller picks a hotel → agent fetches room offers with prices
-5. Caller confirms → agent collects guest details (name, email, phone)
-6. Agent books the room → reads back confirmation ID
+Under the hood, a single OpenAI Realtime model handles speech recognition, reasoning, and voice synthesis in one step. No STT → LLM → TTS pipeline. Sub-second latency.
 
-## Prerequisites
+For the full system design, evolution from the original three-model pipeline, and the validation guards built from real call failures, see [docs/architecture.md](docs/architecture.md).
 
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- API keys for:
-  - **LiveKit Cloud** — [cloud.livekit.io](https://cloud.livekit.io)
-  - **Anthropic** — [console.anthropic.com](https://console.anthropic.com)
-  - **Deepgram** — [console.deepgram.com](https://console.deepgram.com)
-  - **Cartesia** — [play.cartesia.ai](https://play.cartesia.ai)
-
-No hotel API key needed for demo mode — the agent uses built-in mock hotel data (real hotel names, realistic prices) that works out of the box.
-
-## Setup
+## Quick start
 
 ```bash
 git clone https://github.com/jeemeekay/sada-hotel-agent.git
 cd sada-hotel-agent
 
 cp env.example .env
-# Fill in your LiveKit, Anthropic, Deepgram, and Cartesia keys
+# Fill in: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, OPENAI_API_KEY
 
 uv sync
-```
-
-## Run
-
-```bash
 uv run src/agent.py dev
 ```
 
-Then open the [LiveKit Agents Playground](https://agents-playground.livekit.io) or connect via SIP.
+Open [sada.sh/sada-hotel-agent.html](https://sada.sh/sada-hotel-agent.html) or the [LiveKit Playground](https://agents-playground.livekit.io) and start talking.
 
-Try: *"I'd like to book a hotel in Dubai for July 25th to the 28th."*
+## Prerequisites
 
-## Project Structure
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- [LiveKit Cloud](https://cloud.livekit.io) account (free tier available)
+- [OpenAI](https://platform.openai.com) API key with Realtime API access
+
+No hotel API key needed — the agent ships with realistic mock hotel data for 36 cities.
+
+## Project structure
 
 ```
 sada-hotel-agent/
 ├── src/
-│   ├── agent.py            # LiveKit agent with tool definitions
-│   └── amadeus_client.py   # Hotel API (mock data + Hotelbeds support)
-├── env.example             # Environment variable template
-├── .gitignore
-├── pyproject.toml
-└── README.md
+│   ├── agent.py           # Agent, tools, system prompt, session setup
+│   ├── hotel_client.py    # Hotel search/book (mock data + Hotelbeds)
+│   ├── voice_utils.py     # Phonetic spelling, email parsing, validation
+│   └── session_log.py     # Per-session transcript and debug logging
+├── web/
+│   └── sada-hotel-agent.html  # Browser voice client
+├── server/
+│   └── token_server.py    # Standalone token server (alternative to Vercel)
+├── deploy/
+│   └── sada-agent.service # systemd unit for the agent
+├── docs/
+│   └── architecture.md    # System design, evolution, guard documentation
+├── env.example
+└── pyproject.toml
 ```
 
-## Hotel API Modes
-
-The agent supports two modes, set via `HOTEL_API_MODE` in `.env`:
-
-| Mode | Description | API Key Needed? |
-|---|---|---|
-| `mock` (default) | Realistic demo data — real hotel names in Dubai, Abu Dhabi, London, Paris, NYC. Deterministic prices. Demo booking confirmations. | No |
-| `hotelbeds` | Live hotel data via [Hotelbeds APItude API](https://developer.hotelbeds.com). Real availability, real bookings. | Yes |
-
-### Why mock mode?
-
-Amadeus Self-Service APIs were [decommissioned on July 17, 2026](https://www.phocuswire.com/amadeus-shut-down-self-service-apis-portal-developers). Mock mode lets you demo the full voice booking flow without any hotel API dependency. The architecture is provider-agnostic — swap in Hotelbeds, Expedia Rapid, or any other provider by implementing the same three functions: `search_hotels`, `search_offers`, `book_hotel`.
-
-## How the Tools Work
+## Agent tools
 
 | Tool | Purpose |
 |---|---|
-| `search_hotels_in_city` | Find hotels by city name (30+ cities supported) |
-| `get_hotel_offers` | Get rooms, prices, cancellation policies for selected hotels |
-| `book_hotel_room` | Create reservation with guest details → returns confirmation ID |
+| `search_hotels_in_city` | Find hotels by city name (36 cities) |
+| `get_hotel_offers` | Rooms, prices, cancellation policies |
+| `confirm_email` | Parse spoken email ("kayode at o four j dot co dot uk") |
+| `spell_back` | NATO phonetic script for any string |
+| `prepare_booking` | Validate and stage details (does not book) |
+| `book_hotel_room` | Commit the reservation (requires prior confirmation) |
 
-## Connecting via SIP (Phone Calls)
+## Logging
 
-Works with the existing LiveKit SIP setup (Asterisk → LiveKit Cloud trunk). Dial extension 700 from the softphone to reach the agent.
+Every conversation writes a transcript to `logs/` (local) or `/var/log/sada/sessions/` (server):
+
+```
+15:16:30    >>>  search_hotels_in_city(city='Dubai')
+15:17:01    >>>  prepare_booking(name='Kayode Olajide', phone='+44')
+15:17:01    !!!  prepare_booking REJECTED: '+44' is only 2 digits...
+```
+
+See [docs/architecture.md](docs/architecture.md) for the full logging format and `jq` queries for filtering sessions.
+
+## Deployment
+
+The live deployment uses three services:
+
+- **Vercel** — serves the page and mints LiveKit tokens (`sada-landing` repo)
+- **Hetzner** — runs the agent process (`sada-agent.service`)
+- **LiveKit Cloud** — routes audio between browser and agent
+
+See [docs/architecture.md](docs/architecture.md) for the deployment topology and server setup.
 
 ## Part of SADA (صدى)
 
-This agent is a vertical demo for [SADA](https://sada.sh), a UAE-compliant, Arabic-native AI voice agent platform for the Middle East.
+This agent is a vertical demo for [SADA](https://sada.sh) — AI voice agents the Middle East can trust.
