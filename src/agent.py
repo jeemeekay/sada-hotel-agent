@@ -2,13 +2,10 @@
 SADA Hotel Booking Voice Agent
 
 A LiveKit voice agent that helps callers search for and book hotels by voice.
-All models run through LiveKit Inference, so only LIVEKIT_* credentials
-are required — no Deepgram, Cartesia, OpenAI, or Anthropic keys.
+Uses OpenAI's Realtime API for speech-to-speech — a single model that hears
+and speaks directly, replacing the separate STT → LLM → TTS pipeline.
 
-Pipeline:
-    STT  → deepgram/nova-3
-    LLM  → google/gemini-2.5-flash
-    TTS  → cartesia/sonic-3
+Requires: LIVEKIT_* credentials + OPENAI_API_KEY
 
 Hotel data comes from mock mode (default) or the Hotelbeds API.
 
@@ -29,12 +26,11 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     RunContext,
-    TurnHandlingOptions,
     cli,
     function_tool,
-    inference,
 )
 from livekit.agents.llm import ToolError
+from livekit.plugins import openai
 
 from hotel_client import (
     resolve_city_code,
@@ -70,8 +66,13 @@ logger = logging.getLogger("sada-hotel-agent")
 def build_instructions() -> str:
     """Build the system prompt with today's date injected at runtime."""
     today = date.today().isoformat()
-    return f"""You are SADA, an AI hotel booking assistant. You speak with \
-callers over the phone and help them find and reserve hotel rooms.
+    return f"""You are SADA, an AI hotel booking assistant. You help \
+callers find and reserve hotel rooms.
+
+# Language
+Always speak English by default. If the caller speaks to you in Arabic or \
+any other language, switch to that language for the rest of the conversation. \
+Never start in Arabic unless the caller does first.
 
 # Voice output rules (critical)
 Your replies are spoken aloud. Therefore:
@@ -700,27 +701,15 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("session transcript: %s", agent.log.path)
 
     session = AgentSession(
-        # All three models run through LiveKit Inference. The only
-        # credentials needed are LIVEKIT_URL / API_KEY / API_SECRET.
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
-        # gpt-4.1-mini chosen over gemini-2.5-flash for time-to-first-token;
-        # the caller hears every extra second as dead air.
-        llm=inference.LLM(model="openai/gpt-4.1-mini"),
-        tts=inference.TTS(
-            model="cartesia/sonic-3",
-            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        # OpenAI Realtime API: a single model that hears and speaks directly.
+        # Replaces the separate STT → LLM → TTS pipeline, cutting latency
+        # from 15-26s to sub-second, and bypassing LiveKit Inference entirely
+        # (which had exhausted its free tier).
+        llm=openai.realtime.RealtimeModel(
+            model="gpt-realtime",
+            voice="ash",
+            temperature=0.7,
         ),
-        turn_handling=TurnHandlingOptions(
-            interruption={
-                # Browser mics are cleaner than phone lines, but background
-                # noise should still not cut the agent off permanently.
-                "resume_false_interruption": True,
-                "false_interruption_timeout": 1.0,
-            },
-            preemptive_generation={"enabled": True, "max_retries": 3},
-        ),
-        aec_warmup_duration=3.0,
-        tts_text_transforms=["filter_emoji", "filter_markdown"],
     )
 
     @session.on("conversation_item_added")
